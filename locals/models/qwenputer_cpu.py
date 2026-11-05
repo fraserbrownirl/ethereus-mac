@@ -878,6 +878,8 @@ class CPU:
         (contiguous float32, float32 and uint32: the computer's own buffers, see ``shared``) updated in place;
         returns ``c`` too. ``threads``: cores the run's attention layers are shared out to (each key head and value
         head the same work on whichever does it). (The GIL is let go meanwhile.)"""
+        if first < 0:  # (-1: Qwen's turn, no computer token to run from; the C embedding would read before its table)
+            raise ValueError(f"a run starts from a computer token, not {first}")
         for a, dt in ((s, np.float32), (c, np.float32), (mk, np.uint32)):
             if a.dtype != dt or not a.flags.c_contiguous or not a.flags.writeable:
                 raise ValueError("the computer's buffers: contiguous and writable, float32 state and convolutions, uint32 masks")

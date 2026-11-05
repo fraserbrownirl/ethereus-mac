@@ -85,29 +85,19 @@ uv run pytest tests/test_ethereus.py -q -k "0xZZ"
 ## 5. C stepper
 
 The C stepper (`qwenputer_cpu`, built with clang) runs the same pack
-on CPU cores. Its Ethereus check mirrors Qwenputer's: a run on a core
-is the GPU's, bit for bit (state, convolutions, masks), on host
-copies and in place on the device's buffers:
+on CPU cores. `scripts/ethereus_c_check.py` runs each eth call three ways from
+the same state, the reference (`bridge.Session`), the GPU walker
+(`Computer.step`, as served) and `CPU.run`, and requires all three to be the
+same tokens. (A run must start from a token the computer predicted: after
+arbitrary prompt ids it predicts nothing, `read` gives -1, and `CPU.run`
+now refuses that instead of reading before its tables.) On an Apple-silicon
+Mac: keccak 0xZZ 3,834 tokens, C 1.46 s, walker 3.39 s; keccak 0x6161 53,917
+tokens, C 26.77 s, walker 19.87 s; all equal to the reference.
+(It compares tokens, not the state buffers bit for bit.)
 
 ```sh
-uv run pytest tests/test_ethereus.py -q -k "0xZZ"   # (uses the GPU path; the C check below is separate)
-uv run python - <<'EOF'
-import numpy as np
-from locals.models import qwenputer as Q
-from locals.models.qwenputer_walk import Computer, Device
-from locals.models.qwenputer_cpu import CPU, shared
-import tempfile
-chip = Q.Chip(Q.pack_dir_eth())
-dev = Device(chip)
-comp = Computer(dev)
-comp.start([1, 2, 3])
-first = int(comp.read([4, 5, 6])[-1])
-s, c, mk = (np.array(x) for x in (comp.s, comp.c, comp.mk))
-cpu = CPU.make(dev, tempfile.mkdtemp())
-assert cpu is not None, "no C compiler (xcode-select --install)"
-rest, _ = cpu.run(s.copy(), c.copy(), mk.copy(), first)
-print("C stepper ran", len(rest), "tokens")
-EOF
+LOCALS_CHIPFORMER=... ETH_SRC=... PYTHONPATH=$LOCALS_CHIPFORMER \
+  uv run python scripts/ethereus_c_check.py "keccak 0xZZ" "keccak 0x6161"
 ```
 
 A full C-vs-GPU exactness test for Ethereus (the 50 calls through
