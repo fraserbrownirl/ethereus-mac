@@ -73,3 +73,23 @@ longest (the Mac test runs all 68 fully). The oracle is the
 `bridge`, `elf`, `spec` to the main tree; all 68 wants verified equal
 under both); its `eval_exact.json` vectors (e.g. transfer_checked data
 `0x0c68866102c407000009`) match the firmware's answers.
+
+## Walker store decode (Metal walker, C stepper, FusedStep)
+
+A files call (store put/list/get) answers with the store's chip tokens
+(SP/SN/SO/SL/SG) and any-printed text (the class code stays 0; the id
+code names the text token, cf. `chat.py:code_token`). The walkers
+decoded neither, so such a call stopped at its first store token.
+`convert` now records the id-code positions (`chip.json: id_code`;
+both packs' `chip.json` regenerated, `chip.safetensors` unchanged),
+and all five prediction paths decode both: `CpuChip.predict`,
+`Chip.predict`, the `FusedStep` kernel (which also embeds any-printed
+text rows), the walk kernels (`_SOURCE`, `_TOKEN`), and the C stepper
+(`Tab: NSTORE/SFSIZE/SFBASE/IDC/NIDC`). `tests/test_store_calls.py`
+runs put/list/get in one session against `store.StoreSession` token
+for token (Linux: pass; it fails before the fix at the put's "ok");
+`scripts/ethereus_c_check.py storelist` runs the same three ways
+(C, GPU walker, reference) on a Mac. Non-store runs are unaffected:
+the id code is unset at every position of the eth/sol suites (spot-
+checked), and the new kernel branches are inert for packs without
+`store_families`/`id_code`.

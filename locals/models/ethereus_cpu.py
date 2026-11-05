@@ -67,6 +67,7 @@ class CpuChip:
         self.H = self.info["hidden"]
         self.code = self.W["dims"]  # placeholder, replaced below
         self.code_idx = list(self.info["code"])
+        self.id_idx = list(self.info.get("id_code") or [])
         self.nfam, self.npay = self.info["nfam"], self.info["npay"]
         self.printable = self.info["printable"]
         self.out_names = self.info.get("out_names", Q.OUT_NAMES)
@@ -268,7 +269,8 @@ class CpuChip:
         return x
 
     def predict(self, h: torch.Tensor) -> np.ndarray:
-        code = h.float().numpy()[:, :, self.code_idx]
+        hn = h.float().numpy()
+        code = hn[:, :, self.code_idx]
         set_ = (code != 0).any(-1)
         bits = (code > 0).astype(np.int64)
         fid = (bits[..., : self.nfam] << np.arange(self.nfam)).sum(-1)
@@ -276,6 +278,13 @@ class CpuChip:
         out = np.full(code.shape[:-1], -1, np.int64)
         for i in zip(*np.nonzero(set_)):
             out[i] = self.decode(int(fid[i]), int(pay[i]))
+        if self.id_idx:  # the store's any-print: the class code stays 0, the id bits name the text token
+            idc = hn[:, :, self.id_idx]
+            idset = (idc != 0).any(-1)
+            idbits = (idc > 0).astype(np.int64)
+            idv = (idbits << np.arange(len(self.id_idx))).sum(-1)
+            for i in zip(*np.nonzero(idset)):
+                out[i] = int(idv[i])
         return out
 
     def decode(self, fid: int, p: int) -> int:

@@ -81,6 +81,7 @@ typedef struct {
     int SPEC_IDS, BITOF, FBASE, FSIZE, CODE, PRINT, SPEC_ROWS, PLAIN, EXPL_ROWS, FAM_BASE, FAM_DELTA;
     int PRE;
     int NDET, DET_IDS, DET_ROWS, IDBOF;
+    int NSTORE, SFSIZE, SFBASE, IDC, NIDC;
 } Tab;
 
 static inline float r16(float x) {
@@ -743,11 +744,22 @@ int qp_run(const Tab* T, float* s, float* cA, float* cB, uint32_t* mk, float* sc
             int bit = c > 0.0f ? 1 : 0;
             if (i < T->NFAM) fid |= bit << i; else pay |= bit << (i - T->NFAM);
         }
+        int idv = 0, idset = 0;
+        for (int i = 0; i < T->NIDC; i++) {
+            float c = x[I[T->IDC + i]];
+            idset = idset || (c != 0.0f);
+            if (c > 0.0f) idv |= 1 << i;
+        }
         int tok = -1;
-        if (set) {
+        if (idset) tok = idv;  // the store's any-print: the id code names the text token
+        else if (set) {
             if (fid < T->NFAMS) tok = pay < I[T->FSIZE + fid] ? T->V0 + I[T->FBASE + fid] + pay : -2;
             else if (fid < T->NFAMS + T->NCTRL) tok = T->V0 + T->CTRL + (fid - T->NFAMS);
             else if (fid == T->NFAMS + T->NCTRL && pay < T->NPRINT) tok = I[T->PRINT + pay];
+            else if (fid > T->NFAMS + T->NCTRL && fid <= T->NFAMS + T->NCTRL + T->NSTORE) {  // the store's families
+                int k = fid - T->NFAMS - T->NCTRL - 1;
+                tok = pay < I[T->SFSIZE + k] ? T->V0 + I[T->SFBASE + k] + pay : -2;
+            }
             else tok = -2;
         }
         if (tok == -1 && cur >= T->V0) tok = -3;
@@ -786,7 +798,8 @@ class _Mat(ctypes.Structure):
 
 
 _CONSTS = ("R H V0 CTRL NFAM NPAY NFAMS NCTRL NPRINT NSPEC EXPL_A EXPL_N META MSTRIDE SCR CSTRIDE SPEC_IDS BITOF FBASE FSIZE "
-           "CODE PRINT SPEC_ROWS PLAIN EXPL_ROWS FAM_BASE FAM_DELTA PRE NDET DET_IDS DET_ROWS IDBOF").split()
+           "CODE PRINT SPEC_ROWS PLAIN EXPL_ROWS FAM_BASE FAM_DELTA PRE NDET DET_IDS DET_ROWS IDBOF "
+           "NSTORE SFSIZE SFBASE IDC NIDC").split()
 
 
 class _Tab(ctypes.Structure):
@@ -830,7 +843,22 @@ class CPU:
         self.lib.qp_run.argtypes = [ctypes.POINTER(_Tab), P, P, P, P, P, P, ctypes.c_int, P, ctypes.c_int, ctypes.c_int]
         st, W = dev.stepper, dev.w
         self._own: list = []
-        I, Z = self._keep(st.I, np.int32), self._keep(W.Z, np.uint32)
+        base_I = np.ascontiguousarray(np.array(st.I), np.int32)
+        info = W.chip.info
+        sf = info.get("store_families") or []
+        sizes = [int(s) for _, s in sf]
+        bases, b = [], int(st.consts["CTRL"]) + int(st.consts["NCTRL"])
+        for s in sizes:
+            bases.append(b)
+            b += s
+        idc = [int(v) for v in info.get("id_code") or [0]]
+        nstore, off = len(sizes), len(base_I)
+        sfsizes, sfbases = (sizes or [0]), (bases or [0])
+        I = self._keep(np.r_[base_I, np.array(sfsizes, np.int32), np.array(sfbases, np.int32),
+                             np.array(idc, np.int32)], np.int32)
+        consts = dict(st.consts, NSTORE=nstore, SFSIZE=off, SFBASE=off + len(sfsizes),
+                      IDC=off + len(sfsizes) + len(sfbases), NIDC=len(info.get("id_code") or []))
+        Z = self._keep(W.Z, np.uint32)
         Fl, bits = self._keep(W.Fl, np.float32), self._keep(W.bits, np.uint8)
         prog = []
         for kind, L, n, kc in st.kernels:
@@ -849,7 +877,7 @@ class CPU:
         self.scr = max(int(st.scr), 1)
         self.tab = _Tab(I.ctypes.data, Z.ctypes.data, Fl.ctypes.data, bits.ctypes.data, prog.ctypes.data, tok.ctypes.data,
                         ctypes.cast(self._mains, P), ctypes.cast(self._ress, P), len(st.kernels),
-                        *[int(st.consts[n]) for n in _CONSTS])
+                        *[int(consts[n]) for n in _CONSTS])
 
     def _keep(self, a, dtype) -> np.ndarray:
         a = np.ascontiguousarray(np.array(a), dtype=dtype)

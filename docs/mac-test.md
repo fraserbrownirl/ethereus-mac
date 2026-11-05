@@ -76,22 +76,25 @@ export LOCALS_CHIPFORMER=/path/to/chipformer   # experimental/riscv, with chipfo
 ## 4. Exactness: packs vs reference
 
 ```sh
-uv run pytest tests/test_ethereus.py tests/test_sol.py -q
+uv run pytest tests/test_ethereus.py tests/test_sol.py tests/test_store_calls.py -q
 ```
 
 This runs each pack's computer on the GPU (MLX `Chip` + `FusedStep`)
 against `bridge.Session` on its firmware, token for token: 50 `eth`
-calls (keccak, ABI encode/decode, EIP-712 type hashes, address checks)
-and 68 `sol` calls (SHA-256, base58, amounts, u64/u128, discriminators,
-borsh, instruction building, fees, rent, key/pda/seed/ATA). Expect
-`118 passed` (plus the categories checks). On an M2 Pro about
-15–30 minutes; the long keccak and ed25519 runs dominate.
+calls (keccak, ABI encode/decode, EIP-712 type hashes, address checks),
+68 `sol` calls (SHA-256, base58, amounts, u64/u128, discriminators,
+borsh, instruction building, fees, rent, key/pda/seed/ATA), and the
+files calls (store put, list, get in one session against
+`store.StoreSession`). Expect `119 passed` (plus the categories
+checks). On an M2 Pro about 15–30 minutes; the long keccak and
+ed25519 runs dominate.
 
 Single short calls, to smoke-test each setup first:
 
 ```sh
 uv run pytest tests/test_ethereus.py -q -k "0xZZ"
 SOL_PACK=~/.locals/ethereus/sol9b uv run pytest tests/test_sol.py -q -k "u64 and 1+2"
+uv run pytest tests/test_store_calls.py -q
 ```
 
 ## 5. C stepper
@@ -109,14 +112,18 @@ tokens, C 26.77 s, walker 19.87 s; all equal to the reference.
 
 ```sh
 LOCALS_CHIPFORMER=... ETH_SRC=... PYTHONPATH=$LOCALS_CHIPFORMER \
-  uv run python scripts/ethereus_c_check.py "keccak 0xZZ" "keccak 0x6161"
+  uv run python scripts/ethereus_c_check.py "keccak 0xZZ" "keccak 0x6161" storelist
 ```
+
+(`storelist` runs the files calls — put, list, get in one store
+session — the same three ways against `store.StoreSession`: it covers
+the walkers' store-family decode and any-print paths.)
 
 A full C-vs-GPU exactness test for Ethereus (the 50 calls through
 `CPU.run`, asserting the reference run and bit-identical state) is
-future work; the walkers' store embedding (`IDBOF`/`DET_IDS` tables)
-and the ballast count (`PRE` from the pack) are new in this fork and
-worth covering there. Qwenputer's C tests still run:
+future work; `storelist` already covers the walkers' store paths
+(store-family decode, any-print) through both. Qwenputer's C tests
+still run:
 
 ```sh
 uv run pytest tests/test_qwenputer_c.py tests/test_qwenputer.py -q
@@ -140,10 +147,11 @@ eth tool." or "What is sha256 of abc? Use the sol tool." The reply's
 Both packs were built from `/workspace/dist-store/q9-store-rv` on CPU
 (the sol pack reuses the eth pack's chip bytes: same checkpoint, same
 `convert`; only the snapshot differs) and reproduce `ref.py` token for
-token — 50 `eth` calls and 68 `sol` calls (torch runner,
+token — 50 `eth` calls, 68 `sol` calls and the files calls (store
+put, list, get in one session; torch runner,
 `locals/models/ethereus_cpu.py`; see `ETHEREUS_CHANGES.md`). On Linux
 the 68 are 62 full runs plus 8k-token prefixes of the 6 ed25519-longest
 (ATA, PDA, key, seed, names); the Mac test runs all 68 fully. The MLX
-walkers and the C build only parse on Linux; their store support
-(`rv1-store` text rows, 23 ballast dims) is new and untested until
-step 4 above passes on a Mac.
+walkers and the C build only parse on Linux (their C/Python table
+order is checked there); their store-family decode and any-print
+paths are new and untested until steps 4–5 above pass on a Mac.

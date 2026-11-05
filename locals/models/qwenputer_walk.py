@@ -298,11 +298,23 @@ while (true) {
         int bit = c > 0.0f ? 1 : 0;
         if (i < NFAM) fid |= bit << i; else pay |= bit << (i - NFAM);
     }
+    int idv = 0;
+    bool idset = false;
+    for (int i = 0; i < NIDC; i++) {
+        float c = xs[I[IDC + i]];
+        idset = idset || (c != 0.0f);
+        if (c > 0.0f) idv |= 1 << i;
+    }
     int tok = -1;
-    if (set) {
+    if (idset) tok = idv;  // the store's any-print: the id code names the text token
+    else if (set) {
         if (fid < NFAMS) tok = pay < I[FSIZE + fid] ? V0 + I[FBASE + fid] + pay : -2;
         else if (fid < NFAMS + NCTRL) tok = V0 + CTRL + (fid - NFAMS);
         else if (fid == NFAMS + NCTRL && pay < NPRINT) tok = I[PRINT + pay];
+        else if (fid > NFAMS + NCTRL && fid <= NFAMS + NCTRL + NSTORE) {  // the store's families
+            int k = fid - NFAMS - NCTRL - 1;
+            tok = pay < I[SFSIZE + k] ? V0 + I[SFBASE + k] + pay : -2;
+        }
         else tok = -2;
     }
     if (tok == -1 && cur >= V0) tok = -3;
@@ -408,12 +420,17 @@ class Walker:
                 idbof[int(c)] = 18 + k
         det_ids = np.asarray(e.get("det_ids", np.zeros(0, np.int32)), dtype=np.int32)
         det_rows = np.asarray(e.get("det_rows", np.zeros((1, self.R), np.float32)), dtype=np.float32)
+        from .qwenputer import STORE_FAMILIES
+
+        store = sorted(STORE_FAMILIES.values()) if chip.has_store else [(0, 0)]
         consts = dict(
             META=ints(meta), SPEC_IDS=ints(e["special_ids"]), BITOF=ints(bitof), FBASE=ints([b_ for b_, _ in FAMILIES.values()]),
             FSIZE=ints([s for _, s in FAMILY_SIZES]), CODE=ints(np.array(chip.code)), PRINT=ints(chip.printable),
             SPEC_ROWS=floats(e["special_rows"]), PLAIN=floats(e["plain"]), EXPL_ROWS=floats(e["explicit_rows"]),
             FAM_BASE=floats(e["fam_base"]), FAM_DELTA=floats(e["fam_delta"]),
-            IDBOF=ints(idbof), DET_IDS=ints(det_ids), DET_ROWS=floats(det_rows))
+            IDBOF=ints(idbof), DET_IDS=ints(det_ids), DET_ROWS=floats(det_rows),
+            SFSIZE=ints([s for _, s in store]), SFBASE=ints([b for b, _ in store]),
+            IDC=ints(np.array(chip.id_code or [0], np.int32)))
         self.I = mx.array(np.concatenate(I))
         self.Z = mx.array(np.concatenate(Z))
         self.Fl = mx.array(np.concatenate(Fl))
@@ -422,7 +439,8 @@ class Walker:
                            NFAMS=len(FAMILY_SIZES), NCTRL=len(CONTROL_NAMES), NPRINT=len(chip.printable),
                            NSPEC=len(e["special_ids"]), EXPL_A=qs, EXPL_N=n_qsd, NL=chip.n_layers, MSTRIDE=_M,
                            SSTRIDE=self.sstride, CSTRIDE=self.cstride, PSTRIDE=self.pstride, TG=self.TG,
-                           PRE=int(chip.info.get("ballast_dims", 62)), NDET=len(det_ids))
+                           PRE=int(chip.info.get("ballast_dims", 62)), NDET=len(det_ids),
+                           NSTORE=len(STORE_FAMILIES) if chip.has_store else 0, NIDC=len(chip.id_code))
         self.kernel = mx.fast.metal_kernel(
             name="qwenputer_walk", input_names=["prm", "tokens", "nins", "frees", "I", "Z", "Fl", "bits", "state", "convs"],
             output_names=["pred", "done", "scr", "dbg"], source=_SOURCE, header=_HEADER)
@@ -822,11 +840,23 @@ if (tid == 0) {
         int bit = c > 0.0f ? 1 : 0;
         if (i < NFAM) fid |= bit << i; else pay |= bit << (i - NFAM);
     }
+    int idv = 0;
+    bool idset = false;
+    for (int i = 0; i < NIDC; i++) {
+        float c = xs[I[IDC + i]];
+        idset = idset || (c != 0.0f);
+        if (c > 0.0f) idv |= 1 << i;
+    }
     int tok = -1;
-    if (set) {
+    if (idset) tok = idv;  // the store's any-print: the id code names the text token
+    else if (set) {
         if (fid < NFAMS) tok = pay < I[FSIZE + fid] ? V0 + I[FBASE + fid] + pay : -2;
         else if (fid < NFAMS + NCTRL) tok = V0 + CTRL + (fid - NFAMS);
         else if (fid == NFAMS + NCTRL && pay < NPRINT) tok = I[PRINT + pay];
+        else if (fid > NFAMS + NCTRL && fid <= NFAMS + NCTRL + NSTORE) {  // the store's families
+            int k = fid - NFAMS - NCTRL - 1;
+            tok = pay < I[SFSIZE + k] ? V0 + I[SFBASE + k] + pay : -2;
+        }
         else tok = -2;
     }
     if (tok == -1 && cur[b] >= V0) tok = -3;

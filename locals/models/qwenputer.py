@@ -390,7 +390,9 @@ def convert(src, out) -> dict:
     info = {"format": 2 if has_store else 1, "source": str(src), "hidden": H, "layers": n_chip,
             "chip_token_offset": v0, "chip_vocab": meta["chip_vocab"], "layout": layout,
             "d_qwen": d_qwen, "ballast_dims": meta.get("ballast_dims"),
-            "code": [pos[d] for d in meta["code_dims"]], "tau": pos[meta["tau_dim"]],
+            "code": [pos[d] for d in meta["code_dims"]],
+            "id_code": [pos[d] for d in meta["id_code_dims"]] if has_store and "id_code_dims" in meta else [],
+            "tau": pos[meta["tau_dim"]],
             "mu": pos[meta["mu_dim"]], "nfam": meta["nfam"], "npay": meta["npay"], "tool_call": meta["tool_call"],
             "printable": meta["printable"], "eos": [248046, 248044], "dims": len(dims),
             "out_names": STORE_OUT_NAMES if has_store else OUT_NAMES,
@@ -732,6 +734,7 @@ class Chip:
         self.W = mx.load(str(path / "chip.safetensors"))
         self.n_layers, self.v0, self.H = self.info["layers"], self.info["chip_token_offset"], self.info["hidden"]
         self.code = mx.array(self.info["code"])
+        self.id_code = list(self.info.get("id_code") or [])
         self.nfam, self.npay = self.info["nfam"], self.info["npay"]
         self.printable = self.info["printable"]
         self.out_names = self.info.get("out_names", OUT_NAMES)
@@ -901,6 +904,12 @@ class Chip:
         out = np.full(code.shape[:-1], -1, np.int64)
         for i in zip(*np.nonzero(set_)):
             out[i] = self.decode(int(fid[i]), int(pay[i]))
+        if self.id_code:  # the store's any-print: the class code stays 0, the id bits name the text token
+            idc = np.array(h[..., mx.array(self.id_code)].astype(f32))
+            idset = (idc != 0).any(-1)
+            idv = (((idc > 0).astype(np.int64)) << np.arange(len(self.id_code))).sum(-1)
+            for i in zip(*np.nonzero(idset)):
+                out[i] = int(idv[i])
         return out
 
     def read(self, toks: List[int], st: ChipState) -> np.ndarray:
@@ -1326,7 +1335,8 @@ xo[b * R + r] = static_cast<bfloat16_t>(static_cast<float>(xr) + static_cast<flo
 
 # the next token, decided on the GPU: the output code (its family id and payload) -> the token (a trace token, or
 # Q: the text token the computer echoes) and its embedding row; a row stops where Qwen predicts (-1), on a code that
-# names no token (-2) or where the computer leaves a position after its own token (-3); -4: stopped before
+# names no token (-2) or where the computer leaves a position after its own token (-3); -4: stopped before.
+# (with the store: an any-print leaves the class code at 0 and names the text token in the id code, first)
 _NEXT = """
 uint r = thread_position_in_grid.x, b = thread_position_in_grid.y;
 if (r >= R) return;
@@ -1338,8 +1348,18 @@ for (int i = 0; i < NFAM + NPAY; i++) {
     int bit = c > 0.0f ? 1 : 0;
     if (i < NFAM) fid |= bit << i; else pay |= bit << (i - NFAM);
 }
+int idv = 0;
+bool idset = false;
+for (int i = 0; i < NIDC; i++) {
+    float c = static_cast<float>(h[b * R + idc[i]]);
+    idset = idset || (c != 0.0f);
+    if (c > 0.0f) idv |= 1 << i;
+}
 int tok = -1, f = -1, e = -1;
-if (set) {
+bool anyprint = false;
+if (idset) {
+    tok = idv; anyprint = true;
+} else if (set) {
     if (fid < NFAMS) {
         if (pay < fsize[fid]) { tok = V0 + fbase[fid] + pay; f = fid; e = expl[fbase[fid] + pay]; } else tok = -2;
     } else if (fid < NFAMS + NCTRL) {
@@ -1357,7 +1377,22 @@ bool go = on && tok >= 0;
 if (r == 0) { nt[b] = on ? tok : -4; nact[b] = go ? 1 : 0; }
 float v = 0.0f;
 if (go) {
-    if (e >= 0) v = static_cast<float>(erows[e * R + r]);
+    if (anyprint) {
+        int t = tok;
+        int lo = 0, hi = NSPEC - 1, si = -1;
+        while (lo <= hi) { int mm = (lo + hi) / 2; int vv = spec_ids[mm]; if (vv == t) { si = mm; break; } if (vv < t) lo = mm + 1; else hi = mm - 1; }
+        int dlo = 0, dhi = NDET - 1, di = -1;
+        while (dlo <= dhi) { int mm = (dlo + dhi) / 2; int vv = det_ids[mm]; if (vv == t) { di = mm; break; } if (vv < t) dlo = mm + 1; else dhi = mm - 1; }
+        if (si >= 0) v = static_cast<float>(srows[si * R + r]);
+        else if (di >= 0) v = static_cast<float>(drows[di * R + r]);
+        else {
+            int k = bitof[r];
+            v = k >= 0 ? float((bits[t * 16 + k / 8] >> (7 - k % 8)) & 1) : static_cast<float>(plain[r]);
+            int j = idbof[r];
+            if (j >= 0 && t < 248044) { int kk = j % 18; int bb = (t >> kk) & 1; v = j < 18 ? float(bb) : 128.0f * float(2 * bb - 1); }
+        }
+    }
+    else if (e >= 0) v = static_cast<float>(erows[e * R + r]);
     else if (e <= -2) v = static_cast<float>(srows[prow[-2 - e] * R + r]);
     else {
         v = static_cast<float>(fb[f * R + r]);
@@ -1417,21 +1452,38 @@ class FusedStep:
         self.k_out = mk(name="qwenputer_out", input_names=["x", "y", "wrow", "ptr", "col", "val"],
                         output_names=["xo"], source=_OUT)
         self.k_next = mk(name="qwenputer_next", input_names=["h", "cur", "act", "code", "fsize", "fbase", "expl", "printable",
-                                                             "prow", "erows", "srows", "fb", "fd", "sfsize", "sfbase"],
+                                                             "prow", "erows", "srows", "fb", "fd", "sfsize", "sfbase",
+                                                             "idc", "bits", "plain", "bitof", "idbof",
+                                                             "spec_ids", "det_ids", "drows"],
                          output_names=["nt", "nact", "xn"], source=_NEXT)
         e = chip._emb
         expl = np.full(chip.info.get("chip_vocab", CHIP_VOCAB), -1, np.int32)  # a store pack's tokens run past CHIP_VOCAB
         store = list(STORE_FAMILIES.values()) if chip.has_store else [(0, 0)]
         expl[e["explicit_ids"]] = np.arange(len(e["explicit_ids"]))
         srow = {int(t): i for i, t in enumerate(e["special_ids"])}
+        bitof = np.full(self.R, -1, np.int32)
+        bitof[np.asarray(e["bitcols"])] = np.arange(len(e["bitcols"]))
+        idbof = np.full(self.R, -1, np.int32)  # (store packs: 0..17 xb, 18..35 yc; else all -1)
+        if "id_xb" in e:
+            for k, c in enumerate(np.asarray(e["id_xb"]).tolist()):
+                idbof[int(c)] = k
+            for k, c in enumerate(np.asarray(e["id_yc"]).tolist()):
+                idbof[int(c)] = 18 + k
+        det_ids = np.asarray(e.get("det_ids", np.zeros(0, np.int32)), dtype=np.int32)
         self.tables = [chip.code.astype(mx.int32), mx.array([sz for _, sz in FAMILY_SIZES], mx.int32),
                        mx.array([b for b, _ in FAMILIES.values()], mx.int32), mx.array(expl),
                        mx.array(np.array(chip.printable, np.int32)), mx.array(np.array([srow[t] for t in chip.printable], np.int32)),
                        W["emb.explicit_rows"], W["emb.special_rows"], W["emb.fam_base"], W["emb.fam_delta"],
-                       mx.array([sz for _, sz in store], mx.int32), mx.array([b for b, _ in store], mx.int32)]
+                       mx.array([sz for _, sz in store], mx.int32), mx.array([b for b, _ in store], mx.int32),
+                       mx.array(np.array(chip.id_code or [0], np.int32)),
+                       mx.array(np.asarray(e["bits"], np.uint8).reshape(-1)),
+                       mx.array(np.asarray(e["plain"], np.float32)), mx.array(bitof), mx.array(idbof),
+                       mx.array(np.asarray(e["special_ids"], np.int32)), mx.array(det_ids),
+                       W["emb.det_rows"] if "emb.det_rows" in W else mx.zeros((1, self.R), f32)]
         self.consts = [("R", self.R), ("NFAM", chip.nfam), ("NPAY", chip.npay), ("NFAMS", len(FAMILY_SIZES)),
                        ("NCTRL", len(CONTROL_NAMES)), ("NPRINT", len(chip.printable)), ("V0", chip.v0), ("CTRL", CTRL),
-                       ("NSTORE", len(STORE_FAMILIES) if chip.has_store else 0)]
+                       ("NSTORE", len(STORE_FAMILIES) if chip.has_store else 0),
+                       ("NIDC", len(chip.id_code)), ("NSPEC", len(e["special_ids"])), ("NDET", len(det_ids))]
         self.chip = chip
 
     def _out(self, w, to):
