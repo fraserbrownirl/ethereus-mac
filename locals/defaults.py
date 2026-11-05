@@ -22,6 +22,11 @@ MODELS = {
     # the same, its computer also doing work of the Mac's CPU (a toolbox of 60 tools in C, checks of the client's calls
     # and of the numbers an answer copies, notes, a small Python): slower. Not a repository: Qwenputer's (hf_repo)
     "qwenputer-4b-cpu": "divagr1925/Qwen3.5-4B-Qwenputer-CPU",
+    # Ethereus-9B untrained: Qwen3.5-9B with the eth computer (rv1-store) in 12 layers before Qwen's
+    # (models/qwenputer.py, ETH_TOOL): Qwen's part is qwen3.5-9b's weights; the computer comes from the local
+    # Ethereus-9B checkpoint, converted into a ~208 MB pack (its firmware is in the repo: eth-bridge.elf).
+    # Not a repository: the pack is built from ETH_SRC (hf_repo falls through to the model itself).
+    "ethereus-9b": "mlx-community/Qwen3.5-9B-MLX-4bit",
 }
 
 
@@ -197,10 +202,17 @@ def _resident_gb(path: Path) -> "float | None":
 
 
 def is_qwenputer(model) -> bool:
-    """Whether ``model`` is Qwenputer, either version (models/qwenputer.py: served by code of its own; every other
-    model is not)."""
+    """Whether ``model`` is Qwenputer, either version, or Ethereus-9B (models/qwenputer.py: served by code
+    of its own; every other model is not)."""
     name = str(model).rstrip("/").split("/")[-1].lower()
-    return name.removesuffix("-cpu") in ("qwen3.5-4b-qwenputer", "qwenputer", "qwenputer-4b")
+    return name.removesuffix("-cpu") in ("qwen3.5-4b-qwenputer", "qwenputer", "qwenputer-4b",
+                                         "ethereus-9b", "ethereus")
+
+
+def is_ethereus(model) -> bool:
+    """Whether ``model`` is Ethereus-9B (the eth computer, not calc)."""
+    name = str(model).rstrip("/").split("/")[-1].lower()
+    return name in ("ethereus-9b", "ethereus")
 
 
 def qwenputer_cpu(model) -> bool:
@@ -210,7 +222,9 @@ def qwenputer_cpu(model) -> bool:
 
 def hf_repo(model) -> str:
     """The Hugging Face repository a model's files come from: Qwenputer's for both its versions (qwenputer-cpu's id
-    names none), else the model itself."""
+    names none), Ethereus-9B's Qwen part for it (its computer comes from a local pack), else the model itself."""
+    if is_ethereus(model):
+        return MODELS["ethereus-9b"]
     return MODELS["qwenputer-4b"] if is_qwenputer(model) else model
 
 
@@ -385,7 +399,8 @@ ALIASES = {"qwen": "qwen3.5-4b", "qwen3.5": "qwen3.5-4b", "gemma": "gemma-4-e4b"
            "gemma-4": "gemma-4-e4b", "gemma4-e4b": "gemma-4-e4b", "gemma-4-e4b-it": "gemma-4-e4b",
            "lfm": "lfm2.5-2.6b", "lfm2.5": "lfm2.5-2.6b", "minicpm": "minicpm5-2b", "minicpm5": "minicpm5-2b",
            "lfm3": "lfm3-1.7b",
-           "flint-40b": "flint", "flint-3bit": "flint", "qwenputer": "qwenputer-4b", "qwenputer-cpu": "qwenputer-4b-cpu"}
+           "flint-40b": "flint", "flint-3bit": "flint", "qwenputer": "qwenputer-4b", "qwenputer-cpu": "qwenputer-4b-cpu",
+           "ethereus": "ethereus-9b"}
 MODEL_HELP = ("model: qwen (Qwen3.5-4B, the default from 16 GB of memory), qwen3.5-2b (the default below), gemma (Gemma 4 "
               "E4B), lfm (LFM2.5-2.6B), lfm3 (LFM3-1.7B), minicpm (MiniCPM5-2B), flint (Recursive's Flint, 24 GB Macs and up), qwenputer "
               "(Qwen3.5-4B with a computer in its weights that runs its calc tool), qwenputer-cpu (the same, its computer "

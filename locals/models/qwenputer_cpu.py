@@ -17,10 +17,10 @@ and the cores make several at once. What makes a core this fast is the computer'
   65,536 bf16 values its input takes, made by the same expression;
 * a norm's sum of squares, added in order, is the ballast's alone when every other square is under half a unit in the
   last place of that sum (checked; else summed);
-* the 62 ballast dims, which never change, come first in the column order: a product's sums over them are made once
-  a run (and made again if their inputs ever differ, checked bit for bit) and each step goes on from them; a unit no
-  other column touches keeps the output it had, and a key head whose queries and keys are the step before's, bit for
-  bit, keeps their norms and the rows they touch.
+* the ballast dims (62 on Qwenputer, 23 on Ethereus-9B), which never change, come first in the column order:
+  a product's sums over them are made once a run (and made again if their inputs ever differ, checked bit for bit)
+  and each step goes on from them; a unit no other column touches keeps the output it had, and a key head whose
+  queries and keys are the step before's, bit for bit, keeps their norms and the rows they touch.
 
 A run works in place on the computer's own device buffers (``shared``: on Apple silicon the GPU's memory is the
 CPU's, so the state is neither copied out for a run nor back after it).
@@ -79,6 +79,8 @@ typedef struct {
     int nk;
     int R, H, V0, CTRL, NFAM, NPAY, NFAMS, NCTRL, NPRINT, NSPEC, EXPL_A, EXPL_N, META, MSTRIDE, SCR, CSTRIDE;
     int SPEC_IDS, BITOF, FBASE, FSIZE, CODE, PRINT, SPEC_ROWS, PLAIN, EXPL_ROWS, FAM_BASE, FAM_DELTA;
+    int PRE;
+    int NDET, DET_IDS, DET_ROWS, IDBOF;
 } Tab;
 
 static inline float r16(float x) {
@@ -171,14 +173,14 @@ static void conv_step(const float* yall, float* cs, int C, const float* cw, int 
 #endif
 }
 
-// A main product's sums over the leading columns that do not change (the 62 ballast dims of the normed residual come
-// first in the column order): made once and kept with the inputs they were made from (checked at every step, bit
-// for bit; made again where they differ), then each step goes on from them over the other columns. Rows the other
-// columns touch are listed (``mark``, ``list``): a unit no varying column touched has the output it had.
-#define PRE 62
+// A main product's sums over the leading columns that do not change (the ballast dims of the normed residual come
+// first in the column order: T->PRE of them): made once and kept with the inputs they were made from (checked at
+// every step, bit for bit; made again where they differ), then each step goes on from them over the other columns.
+// Rows the other columns touch are listed (``mark``, ``list``): a unit no varying column touched has the output it had.
+#define PRE_MAX 64
 typedef struct {
     float* acc0;
-    float hn0[PRE];
+    float hn0[PRE_MAX];
     int valid, changed, n, np;
     unsigned char* mark;
     int* list;   // rows touched this step
@@ -188,8 +190,8 @@ typedef struct {
     float* cout; // a unit's output from acc0 alone
 } Pre;
 
-static void spmv_pre(const Mat* M, const float* src, float* acc, Pre* P, int track) {
-    const int b = M->ncols < PRE ? M->ncols : PRE;
+static void spmv_pre(const Mat* M, const float* src, float* acc, Pre* P, int track, int pre) {
+    const int b = M->ncols < pre ? M->ncols : pre;
     if (!P->valid || memcmp(P->hn0, src, sizeof(float) * b) != 0) {
         memset(P->acc0, 0, sizeof(float) * M->nrows);
         for (int c = 0; c < b; c++) {
@@ -238,12 +240,21 @@ static void embed(const Tab* T, int t, float* x) {
             if (v == t) { si = m; break; }
             if (v < t) lo = m + 1; else hi = m - 1;
         }
+        int dlo = 0, dhi = T->NDET - 1, di = -1;
+        while (dlo <= dhi) {
+            int m = (dlo + dhi) / 2, v = I[T->DET_IDS + m];
+            if (v == t) { di = m; break; }
+            if (v < t) dlo = m + 1; else dhi = m - 1;
+        }
         for (int r = 0; r < R; r++) {
             float v;
             if (si >= 0) v = Fl[T->SPEC_ROWS + si * R + r];
+            else if (di >= 0) v = Fl[T->DET_ROWS + di * R + r];
             else {
                 int k = I[T->BITOF + r];
                 v = k >= 0 ? (float)((T->bits[t * 16 + k / 8] >> (7 - k % 8)) & 1) : Fl[T->PLAIN + r];
+                int j = I[T->IDBOF + r];
+                if (j >= 0 && t < 248044) { int kk = j % 18, b = (t >> kk) & 1; v = j < 18 ? (float)b : 128.0f * (float)(2 * b - 1); }
             }
             x[r] = v;
         }
@@ -278,7 +289,7 @@ static void norm(const Tab* T, const float* xs, float* hn) {
     // The ballast dims come first; the sum of squares, added in order, is theirs alone when every other square is
     // under half a unit in the last place of that sum (each addition then rounds back to it): checked, else summed
     float s = 0.0f;
-    const int B = T->R < PRE ? T->R : PRE;
+    const int B = T->R < T->PRE ? T->R : T->PRE;
     for (int r = 0; r < B; r++) s += xs[r] * xs[r];
     const float hu = (nextafterf(s, INFINITY) - s) * 0.5f;
     int big = 0;
@@ -576,7 +587,7 @@ static void mlp_part(const MlpJob* J, Part* Q) {
     Pre* P = J->P;
     const int32_t* m = T->I + T->META + J->k[1] * T->MSTRIDE;
     const int U = m[17];
-    const int b = M->ncols < PRE ? M->ncols : PRE;
+    const int b = M->ncols < T->PRE ? M->ncols : T->PRE;
     const float* hn = J->hn;
     float* gall = J->gall;
     float* out = J->scr + J->k[2];
@@ -616,8 +627,8 @@ static void mlp_part(const MlpJob* J, Part* Q) {
 }
 
 // the kept sums over the ballast columns, made again where their inputs differ from the ones they were made from
-static void ballast(const Mat* M, const float* src, Pre* P) {
-    const int b = M->ncols < PRE ? M->ncols : PRE;
+static void ballast(const Mat* M, const float* src, Pre* P, int pre) {
+    const int b = M->ncols < pre ? M->ncols : pre;
     if (P->valid && memcmp(P->hn0, src, sizeof(float) * b) == 0) return;
     memset(P->acc0, 0, sizeof(float) * M->nrows);
     for (int c = 0; c < b; c++) {
@@ -632,7 +643,7 @@ static void ballast(const Mat* M, const float* src, Pre* P) {
 
 // an MLP layer, its units shared out to the team (each share its own rows: the same work on whichever does it)
 static void mlp_run(Team* t, const MlpJob* J, int* s0, int* s1) {
-    ballast(J->M, J->hn, J->P);
+    ballast(J->M, J->hn, J->P, J->T->PRE);
     if (t == NULL) mlp_part(J, J->parts);
     else {
         t->mjob = *J;
@@ -719,7 +730,7 @@ int qp_run(const Tab* T, float* s, float* cA, float* cB, uint32_t* mk, float* sc
             const int32_t* k = T->prog + 9 * i;
             if (k[7] > 0) resid(T, T->res + i, x, scr, k[4], k[7], k[8], work);
             norm(T, x, hn);
-            if (k[0] == 0) { spmv_pre(T->main + i, hn, work, pre + i, 0); AttnJob J = {T, k, s, cA, mk, scr, work, keys + i}; attn_run(team, &J, &s0, &s1); }
+            if (k[0] == 0) { spmv_pre(T->main + i, hn, work, pre + i, 0, T->PRE); AttnJob J = {T, k, s, cA, mk, scr, work, keys + i}; attn_run(team, &J, &s0, &s1); }
             else { MlpJob J = {T, k, T->main + i, pre + i, parts + i * nparts, hn, scr, work}; mlp_run(team, &J, &s0, &s1); }
         }
         const int32_t* tk = T->tok;
@@ -775,7 +786,7 @@ class _Mat(ctypes.Structure):
 
 
 _CONSTS = ("R H V0 CTRL NFAM NPAY NFAMS NCTRL NPRINT NSPEC EXPL_A EXPL_N META MSTRIDE SCR CSTRIDE SPEC_IDS BITOF FBASE FSIZE "
-           "CODE PRINT SPEC_ROWS PLAIN EXPL_ROWS FAM_BASE FAM_DELTA").split()
+           "CODE PRINT SPEC_ROWS PLAIN EXPL_ROWS FAM_BASE FAM_DELTA PRE NDET DET_IDS DET_ROWS IDBOF").split()
 
 
 class _Tab(ctypes.Structure):

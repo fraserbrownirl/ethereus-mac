@@ -24,7 +24,15 @@ import os
 from collections import OrderedDict
 from typing import List, Optional
 
-import mlx.core as mx
+try:
+    import mlx.core as mx
+
+    f32, bf16 = mx.float32, mx.bfloat16
+    HAVE_MLX = True
+except ImportError:  # (Linux: parses without MLX; the walkers run on the Mac)
+    mx = None  # type: ignore
+    f32, bf16 = None, None  # type: ignore
+    HAVE_MLX = False
 import numpy as np
 
 from .qwenputer import CHIP_VOCAB, CONTROL_NAMES, CTRL, FAMILIES, FAMILY_SIZES, HEAD, Chip, ChipState, FusedStep
@@ -32,8 +40,6 @@ from .qwenputer import CHIP_VOCAB, CONTROL_NAMES, CTRL, FAMILIES, FAMILY_SIZES, 
 # A run's tokens at most (then it failed): the toolbox's longest, a 900-token call's text written backwards, takes
 # about 200,000 (a minute on a core); its text counted, 80,000 to 110,000
 MAX_RUN = 250_000
-
-f32, bf16 = mx.float32, mx.bfloat16
 
 _HEADER = """
 inline float r16(float x) { return static_cast<float>(static_cast<bfloat16_t>(x)); }
@@ -94,12 +100,17 @@ while (true) {
         if (t < V0) {
             int lo = 0, hi = NSPEC - 1, si = -1;
             while (lo <= hi) { int m = (lo + hi) / 2; int v = I[SPEC_IDS + m]; if (v == t) { si = m; break; } if (v < t) lo = m + 1; else hi = m - 1; }
+            int dlo = 0, dhi = NDET - 1, di = -1;
+            while (dlo <= dhi) { int m = (dlo + dhi) / 2; int v = I[DET_IDS + m]; if (v == t) { di = m; break; } if (v < t) dlo = m + 1; else dhi = m - 1; }
             for (uint r = tid; r < R; r += TG) {
                 float v;
                 if (si >= 0) v = Fl[SPEC_ROWS + si * R + r];
+                else if (di >= 0) v = Fl[DET_ROWS + di * R + r];
                 else {
                     int k = I[BITOF + r];
                     v = k >= 0 ? float((bits[t * 16 + k / 8] >> (7 - k % 8)) & 1) : Fl[PLAIN + r];
+                    int j = I[IDBOF + r];
+                    if (j >= 0 && t < 248044) { int kk = j % 18; int b = (t >> kk) & 1; v = j < 18 ? float(b) : 128.0f * float(2 * b - 1); }
                 }
                 xs[r] = v;
             }
@@ -379,15 +390,30 @@ class Walker:
         qs, ctrl = FAMILIES["QS"][0], CTRL
         n_qsd = FAMILIES["QS"][1] + FAMILIES["QD"][1]
         assert FAMILIES["QD"][0] == qs + FAMILIES["QS"][1]
-        assert np.array_equal(expl, np.r_[np.arange(qs, qs + n_qsd), np.arange(ctrl, ctrl + len(CONTROL_NAMES))]), \
-            "trace tokens kept whole are not QS, QD and the controls"
+        want_expl = np.r_[np.arange(qs, qs + n_qsd), np.arange(ctrl, ctrl + len(CONTROL_NAMES))]
+        if chip.info.get("store_families"):  # (+ the store's families, explicit, after the controls)
+            from .qwenputer import STORE_FAMILIES
+
+            want_expl = np.r_[want_expl, np.concatenate([np.arange(b, b + s) for _, (b, s) in
+                                                         sorted(STORE_FAMILIES.items(), key=lambda kv: kv[1][0])])]
+        assert np.array_equal(np.asarray(expl), want_expl), \
+            "trace tokens kept whole are not QS, QD, the controls (and the store's)"
         bitof = np.full(self.R, -1, np.int32)
         bitof[np.asarray(e["bitcols"])] = np.arange(len(e["bitcols"]))
+        idbof = np.full(self.R, -1, np.int32)  # (store packs: 0..17 xb, 18..35 yc; else all -1)
+        if "id_xb" in e:
+            for k, c in enumerate(np.asarray(e["id_xb"]).tolist()):
+                idbof[int(c)] = k
+            for k, c in enumerate(np.asarray(e["id_yc"]).tolist()):
+                idbof[int(c)] = 18 + k
+        det_ids = np.asarray(e.get("det_ids", np.zeros(0, np.int32)), dtype=np.int32)
+        det_rows = np.asarray(e.get("det_rows", np.zeros((1, self.R), np.float32)), dtype=np.float32)
         consts = dict(
             META=ints(meta), SPEC_IDS=ints(e["special_ids"]), BITOF=ints(bitof), FBASE=ints([b_ for b_, _ in FAMILIES.values()]),
             FSIZE=ints([s for _, s in FAMILY_SIZES]), CODE=ints(np.array(chip.code)), PRINT=ints(chip.printable),
             SPEC_ROWS=floats(e["special_rows"]), PLAIN=floats(e["plain"]), EXPL_ROWS=floats(e["explicit_rows"]),
-            FAM_BASE=floats(e["fam_base"]), FAM_DELTA=floats(e["fam_delta"]))
+            FAM_BASE=floats(e["fam_base"]), FAM_DELTA=floats(e["fam_delta"]),
+            IDBOF=ints(idbof), DET_IDS=ints(det_ids), DET_ROWS=floats(det_rows))
         self.I = mx.array(np.concatenate(I))
         self.Z = mx.array(np.concatenate(Z))
         self.Fl = mx.array(np.concatenate(Fl))
@@ -395,7 +421,8 @@ class Walker:
         self.consts = dict(consts, R=self.R, H=self.H, V0=chip.v0, CTRL=CTRL, NFAM=chip.nfam, NPAY=chip.npay,
                            NFAMS=len(FAMILY_SIZES), NCTRL=len(CONTROL_NAMES), NPRINT=len(chip.printable),
                            NSPEC=len(e["special_ids"]), EXPL_A=qs, EXPL_N=n_qsd, NL=chip.n_layers, MSTRIDE=_M,
-                           SSTRIDE=self.sstride, CSTRIDE=self.cstride, PSTRIDE=self.pstride, TG=self.TG)
+                           SSTRIDE=self.sstride, CSTRIDE=self.cstride, PSTRIDE=self.pstride, TG=self.TG,
+                           PRE=int(chip.info.get("ballast_dims", 62)), NDET=len(det_ids))
         self.kernel = mx.fast.metal_kernel(
             name="qwenputer_walk", input_names=["prm", "tokens", "nins", "frees", "I", "Z", "Fl", "bits", "state", "convs"],
             output_names=["pred", "done", "scr", "dbg"], source=_SOURCE, header=_HEADER)
@@ -818,10 +845,14 @@ if (t >= 0) {
     if (t < V0) {
         int lo = 0, hi = NSPEC - 1, si = -1;
         while (lo <= hi) { int mm = (lo + hi) / 2; int v = I[SPEC_IDS + mm]; if (v == t) { si = mm; break; } if (v < t) lo = mm + 1; else hi = mm - 1; }
+        int dlo = 0, dhi = NDET - 1, di = -1;
+        while (dlo <= dhi) { int mm = (dlo + dhi) / 2; int v = I[DET_IDS + mm]; if (v == t) { di = mm; break; } if (v < t) dlo = mm + 1; else dhi = mm - 1; }
         for (uint r = tid; r < R; r += TGS) {
             float v;
             if (si >= 0) v = Fl[SPEC_ROWS + si * R + r];
-            else { int k = I[BITOF + r]; v = k >= 0 ? float((bits[t * 16 + k / 8] >> (7 - k % 8)) & 1) : Fl[PLAIN + r]; }
+            else if (di >= 0) v = Fl[DET_ROWS + di * R + r];
+            else { int k = I[BITOF + r]; v = k >= 0 ? float((bits[t * 16 + k / 8] >> (7 - k % 8)) & 1) : Fl[PLAIN + r];
+                   int j = I[IDBOF + r]; if (j >= 0 && t < 248044) { int kk = j % 18; int bb = (t >> kk) & 1; v = j < 18 ? float(bb) : 128.0f * float(2 * bb - 1); } }
             xo[b * R + r] = v;
         }
     } else {
@@ -1932,6 +1963,8 @@ class Presenter:
 
 # -- the computer in Locals's batch engine -----------------------------------------------------------------------
 def _controller_base():
+    if not HAVE_MLX:  # (Linux: parses without the engine; serving runs on the Mac)
+        return object
     from ..engine import Controller
 
     return Controller

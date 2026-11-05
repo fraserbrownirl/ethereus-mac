@@ -39,12 +39,25 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-import mlx.core as mx
+try:
+    import mlx.core as mx
+
+    f32, bf16 = mx.float32, mx.bfloat16
+    HAVE_MLX = True
+except ImportError:  # (Linux/CPU: the pack is built and run with torch instead; see ethereus_cpu.py)
+    mx = None  # type: ignore
+    f32, bf16 = None, None  # type: ignore
+    HAVE_MLX = False
 import numpy as np
 
 REPO = "divagr1925/Qwen3.5-4B-Qwenputer"
 REVISION = "2d9068508f2b680badb7abcded96fdd107e9ba5d"  # the checkpoint the chip pack is made from
 BASE = "mlx-community/Qwen3.5-4B-MLX-4bit"  # Qwen's part: its 32 layers, quantized, are this model's bit for bit
+# Ethereus-9B untrained: Qwen3.5-9B with the eth computer (rv1-store layout) in 12 layers before Qwen's.
+# The checkpoint is local (built under /workspace, not on Hugging Face); ETH_SRC names its folder.
+ETH_BASE = "mlx-community/Qwen3.5-9B-MLX-4bit"  # Qwen's part on the Mac
+ETH_D_QWEN = 4096  # Qwen3.5-9B's hidden size: the computer's dims come after it
+ETH_FIRMWARE = "eth-bridge.elf"  # the eth tool-call firmware, built with -DBRIDGE (see ETHEREUS_CHANGES.md)
 # The authors' reference package (their RV32 machine, circuit compiler, text bridge): it loads the firmware into a
 # chip pack, and drafts the computer's runs while Locals serves (``chipformer()``).
 CHIPFORMER = "ca13310e2f9f788d1dd3feeea8213c1b0c23913c"
@@ -72,11 +85,15 @@ FAMILY_SIZES = [("V", 1 << 15), ("F0", 1 << 15), ("F1", 1 << 15), ("F2", 4), ("J
                 ("BYTE", 512), ("FLT", 8), ("HEX", 16), ("QS", 16), ("QD", 128), ("BD", 256)]
 CONTROL_NAMES = ["NT", "ST0", "ST1", "SS0", "SS1", "HALT", "GO", "SC"]
 OUT_NAMES = [n for n, _ in FAMILY_SIZES] + CONTROL_NAMES + ["Q"]  # the output code's family ids (rv/core.py)
+# The object store's chip tokens (rv1-store layout, Ethereus-9B): after the controls.
+STORE_FAMILY_SIZES = [("SP", 1024), ("SN", 1024), ("SA", 1024), ("SO", 1024), ("SG", 1024),
+                      ("SL", 1024), ("SD", 1)]
+STORE_OUT_NAMES = OUT_NAMES + [n for n, _ in STORE_FAMILY_SIZES]  # (Q stays where it was)
 
 
-def _families():
-    out, base = {}, 0
-    for n, s in FAMILY_SIZES:
+def _families(sizes=None, start=0):
+    out, base = {}, start
+    for n, s in (FAMILY_SIZES if sizes is None else sizes):
         out[n] = (base, s)
         base += s
     return out, base
@@ -84,18 +101,84 @@ def _families():
 
 FAMILIES, CTRL = _families()
 CHIP_VOCAB = CTRL + len(CONTROL_NAMES)
+STORE_FAMILIES, STORE_END = _families(STORE_FAMILY_SIZES, CHIP_VOCAB)
+STORE_VOCAB = STORE_END  # chip tokens with the store's families (Ethereus-9B: 236469)
 
 
 # -- the chip pack ------------------------------------------------------------------------------------------------
+def _load_shard(path):
+    """One safetensors shard's tensors (MLX on the Mac, torch on CPU/Linux)."""
+    if HAVE_MLX:
+        return mx.load(str(path))
+    import torch
+    from safetensors import safe_open
+
+    out = {}
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for k in f.keys():
+            out[k] = f.get_tensor(k)
+    return out
+
+
+def _to_numpy(t) -> np.ndarray:
+    if HAVE_MLX:
+        return np.array(t.astype(mx.float32))
+    import torch
+
+    return t.float().numpy() if isinstance(t, torch.Tensor) else np.asarray(t, dtype=np.float32)
+
+
+def _save_pack(path, arrays: dict) -> None:
+    """Save the chip pack's arrays as safetensors (MLX on the Mac, torch on CPU/Linux)."""
+    if HAVE_MLX:
+        mx.save_safetensors(str(path), arrays)
+        return
+    import torch
+    from safetensors.torch import save_file
+
+    save_file({k: (v.contiguous() if isinstance(v, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(v)))
+                 for k, v in arrays.items()}, str(path))
+
+
+def _as_bf16(x):
+    if HAVE_MLX:
+        return mx.array(x).astype(mx.bfloat16)
+    import torch
+
+    return torch.from_numpy(np.asarray(x)).to(torch.bfloat16)
+
+
+def _as_i32(x):
+    if HAVE_MLX:
+        return mx.array(np.asarray(x, dtype=np.int32))
+    import torch
+
+    return torch.from_numpy(np.asarray(x, dtype=np.int32))
+
+
+def _bf16_roundtrip(x) -> np.ndarray:
+    if HAVE_MLX:
+        return np.array(mx.array(x).astype(mx.bfloat16).astype(mx.float32))
+    import torch
+
+    return torch.from_numpy(np.asarray(x)).to(torch.bfloat16).float().numpy()
+
+
 def convert(src, out) -> dict:
-    """Make the chip pack from the Qwenputer checkpoint folder ``src``: ``out/chip.safetensors`` (the computer
-    layers compacted, the embedding's computer part) and ``out/chip.json``. Reads one tensor at a time."""
+    """Make the chip pack from the checkpoint folder ``src``: ``out/chip.safetensors`` (the computer
+    layers compacted, the embedding's computer part) and ``out/chip.json``. Reads one tensor at a time.
+    Works for Qwenputer (rv1, Qwen3.5-4B) and Ethereus-9B (rv1-store, Qwen3.5-9B); the dims and layout
+    come from the checkpoint's own config, not from hard-coded constants."""
     src, out = Path(src), Path(out)
     meta = json.loads((src / "chipformer.json").read_text())
     cfg = json.loads((src / "config.json").read_text())
     H = cfg["hidden_size"]
     n_chip, v0 = meta["chip_layers"], meta["chip_token_offset"]
-    assert meta["layout"] == "rv1" and meta["chip_dims_offset"] == D_QWEN, meta
+    d_qwen = meta["chip_dims_offset"]
+    layout = meta["layout"]
+    assert layout in ("rv1", "rv1-store"), meta
+    chip_vocab = meta["chip_vocab"]
+    has_store = layout == "rv1-store"
     index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
     shards: Dict[str, dict] = {}
 
@@ -103,8 +186,8 @@ def convert(src, out) -> dict:
         f = index[k]
         if f not in shards:
             shards.clear()  # (one shard open at a time)
-            shards[f] = mx.load(str(src / f))
-        return np.array(shards[f][k].astype(mx.float32))
+            shards[f] = _load_shard(src / f)
+        return _to_numpy(shards[f][k])
 
     nk, nv = cfg["linear_num_key_heads"], cfg["linear_num_value_heads"]
     kd, vd = nk * HEAD, nv * HEAD
@@ -116,8 +199,8 @@ def convert(src, out) -> dict:
         a = {k: get(p + "linear_attn." + k + ".weight") for k in ("in_proj_qkv", "in_proj_z", "in_proj_b",
                                                                    "in_proj_a", "out_proj", "conv1d")}
         for k in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"):
-            assert not a[k][:, :D_QWEN].any(), f"layer {L} {k} reads Qwen's dims"
-        assert not a["out_proj"][:D_QWEN].any(), f"layer {L} writes Qwen's dims"
+            assert not a[k][:, :d_qwen].any(), f"layer {L} {k} reads Qwen's dims"
+        assert not a["out_proj"][:d_qwen].any(), f"layer {L} writes Qwen's dims"
         heads = sorted(h for h in range(nv) if a["out_proj"][:, h * HEAD:(h + 1) * HEAD].any())
         layer = {"heads": heads}
         if heads:
@@ -133,7 +216,7 @@ def convert(src, out) -> dict:
                 A_log=get(p + "linear_attn.A_log")[heads], dt_bias=get(p + "linear_attn.dt_bias")[heads],
                 norm=get(p + "linear_attn.norm.weight"))
         g, u, d = (get(p + "mlp." + k + ".weight") for k in ("gate_proj", "up_proj", "down_proj"))
-        assert not (g[:, :D_QWEN].any() or u[:, :D_QWEN].any() or d[:D_QWEN].any()), f"layer {L} MLP touches Qwen's dims"
+        assert not (g[:, :d_qwen].any() or u[:, :d_qwen].any() or d[:d_qwen].any()), f"layer {L} MLP touches Qwen's dims"
         units = np.nonzero(g.any(1) & u.any(1) & d.any(0))[0]
         if len(units):
             layer.update(gate=_compact(g[units]), up=_compact(u[units]), down=_compact_out(d[:, units]))
@@ -145,31 +228,102 @@ def convert(src, out) -> dict:
                 used.update(layer[k][1].tolist())
         layers.append(layer)
 
-    # the embedding's computer part: text rows are one row plus 128 byte bits (but for 262 special tokens);
-    # trace rows are, per family, a row plus one row per payload bit (but QS, QD and the controls)
+    # the embedding's computer part: text rows are one row plus byte bits (and, with the store, id bits);
+    # trace rows are, per family, a row plus one row per payload bit (but QS, QD, the store and the controls)
     shards.clear()
-    E = mx.load(str(src / index["model.embed_tokens.weight"]))["model.embed_tokens.weight"]
-    cols = np.nonzero(np.array(mx.any(E[:, D_QWEN:] != 0, axis=0)))[0] + D_QWEN
+    E = _to_numpy(_load_shard(src / index["model.embed_tokens.weight"])["model.embed_tokens.weight"])
+    cols = np.nonzero((E[:, d_qwen:] != 0).any(0))[0] + d_qwen
     keep = meta["code_dims"] + [meta["tau_dim"], meta["mu_dim"]]
+    if has_store and "id_code_dims" in meta:
+        keep = keep + meta["id_code_dims"]
     used.update(cols.tolist())
     used.update(keep)
     dims = np.array(sorted(used), dtype=np.int32)
     pos = {int(d): i for i, d in enumerate(dims)}
-    X = np.array(E[:, dims.tolist()].astype(mx.float32))  # (vocab, R)
+    X = E[:, dims.tolist()].astype(np.float32)  # (vocab, R)
     del E
-    T, C = X[:v0], X[v0:v0 + CHIP_VOCAB]
+    assert chip_vocab == (STORE_VOCAB if has_store else CHIP_VOCAB), (chip_vocab, layout)
+    T, C = X[:v0], X[v0:v0 + chip_vocab]
     special = sorted(set(meta["printable"]) | set(meta["tool_call"]))
+    if has_store:
+        # the store zeroes id bits at and above 248044 (<|endoftext|>); those control rows
+        # do not follow plain+bits either, so they are stored explicitly (276 more rows).
+        special = sorted(set(special) | set(range(248044, v0)))
     plain_rows = np.ones(v0, bool)
     plain_rows[special] = False
     Tn = T[plain_rows]
     bitcols = np.nonzero((Tn != Tn[0]).any(0))[0]
-    assert len(bitcols) == 128 and set(np.unique(Tn[:, bitcols]).tolist()) <= {0.0, 1.0}, len(bitcols)
-    plain = Tn[0].copy()
-    plain[bitcols] = 0
-    bits = np.packbits(T[:, bitcols].astype(np.uint8) * plain_rows[:, None], axis=1)  # (v0, 16)
-    check = np.broadcast_to(plain, Tn.shape).copy()
-    check[:, bitcols] = Tn[:, bitcols]
-    assert np.array_equal(check, Tn), "text rows are not one row plus byte bits"
+    id_xb, id_yc, det_ids, det_rows = [], [], [], None
+    if not has_store:
+        assert len(bitcols) == 128 and set(np.unique(Tn[:, bitcols]).tolist()) <= {0.0, 1.0}, len(bitcols)
+        plain = Tn[0].copy()
+        plain[bitcols] = 0
+        bits = np.packbits(T[:, bitcols].astype(np.uint8) * plain_rows[:, None], axis=1)  # (v0, 16)
+        check = np.broadcast_to(plain, Tn.shape).copy()
+        check[:, bitcols] = Tn[:, bitcols]
+        assert np.array_equal(check, Tn), "text rows are not one row plus byte bits"
+    else:
+        # rv1-store: byte bits (128, packed) + the store's id bits (xb/yc, computed from the id)
+        # + token detectors (explicit rows for the few ids where they fire).
+        if chipformer() is None:
+            raise RuntimeError("a store pack needs the authors' package for its tokenizer: " + INSTALL)
+        from chipformer.rv import bridge as _BR
+        from chipformer.rv import store as _ST
+
+        _T = _BR.Text(str(src / "tokenizer.json"))
+        by = np.zeros((v0, 16), dtype=np.uint8)
+        for q in range(v0):
+            by[q] = np.frombuffer(_T.row_bytes(q), dtype=np.uint8)
+        byte_bits = (((by[:, :, None] >> np.arange(8)[None, None, :]) & 1).reshape(v0, 128).astype(np.float32))
+        # byte cols: the 128 bitcols matching the row bytes, in (k, i) order
+        byte_cols, rest = [], list(bitcols)
+        for j in range(128):
+            hit = [c for c in rest if np.array_equal(Tn[:, c], byte_bits[plain_rows][:, j])]
+            assert len(hit) == 1, f"byte bit {j}: {len(hit)} cols"
+            byte_cols.append(hit[0])
+            rest.remove(hit[0])
+        bitcols = np.array(byte_cols, dtype=np.int64)
+        q = np.arange(v0)
+        ok = q < _ST.SPECIAL
+        # xb/yc: 18 cols each, computed from the id (yc is +-128, else 0)
+        for i in range(_ST.ID_BITS):
+            want_x = ((q >> i) & 1).astype(np.float32) * ok
+            hit = [c for c in rest if np.array_equal(T[:, c], want_x)]
+            assert len(hit) == 1, f"xb {i}: {len(hit)} cols"
+            id_xb.append(int(hit[0]))
+            rest.remove(hit[0])
+        for i in range(_ST.ID_BITS):
+            want_y = np.where(ok, 128.0 * (2 * ((q >> i) & 1) - 1), 0.0).astype(np.float32)
+            hit = [c for c in rest if np.array_equal(T[:, c], want_y)]
+            assert len(hit) == 1, f"yc {i}: {len(hit)} cols"
+            id_yc.append(int(hit[0]))
+            rest.remove(hit[0])
+        plain = Tn[0].copy()
+        plain[np.concatenate([bitcols, np.array(id_xb + id_yc), np.array(rest)])] = 0
+        bits = np.packbits(T[:, bitcols].astype(np.uint8) * plain_rows[:, None], axis=1)  # (v0, 16)
+        # detectors: explicit rows for non-special ids where they fire (the rest are plain+bits+id)
+        det_fire = np.nonzero(Tn[:, rest].any(1))[0] if rest else np.array([], dtype=np.int64)
+        det_qids = np.nonzero(plain_rows)[0][det_fire]
+        det_ids = sorted(int(t) for t in det_qids)
+        det_rows = T[det_ids].copy() if det_ids else np.zeros((0, len(dims)), np.float32)
+        check = np.broadcast_to(plain, Tn.shape).copy()
+        check[:, bitcols] = Tn[:, bitcols]
+        for j, c in enumerate(id_xb):
+            check[:, c] = ((np.nonzero(plain_rows)[0] >> j) & 1) * (np.nonzero(plain_rows)[0] < _ST.SPECIAL)
+        for j, c in enumerate(id_yc):
+            qq = np.nonzero(plain_rows)[0]
+            check[:, c] = np.where(qq < _ST.SPECIAL, 128.0 * (2 * ((qq >> j) & 1) - 1), 0.0)
+        if rest:
+            keep_rows = np.ones(len(Tn), bool)
+            keep_rows[det_fire] = False
+            assert np.array_equal(check[keep_rows][:, rest], Tn[keep_rows][:, rest]) or not rest
+            check[:, rest] = Tn[:, rest]
+        assert np.array_equal(check, Tn) or det_ids, "text rows are not plain plus bits, id and detectors"
+        # (rows with detectors are stored explicitly; the rest must match plain+bits+id exactly)
+        if det_ids:
+            mask = np.ones(len(Tn), bool)
+            mask[det_fire] = False
+            assert np.array_equal(check[mask], Tn[mask]), "plain text rows do not match"
     fam_base, fam_delta, explicit = [], [], {}
     for name, (base, size) in FAMILIES.items():
         rows = C[base:base + size]
@@ -185,13 +339,16 @@ def convert(src, out) -> dict:
         fam_delta.append(deltas)
     for t in range(CTRL, CHIP_VOCAB):
         explicit[t] = C[t]
+    if has_store:  # the store's families are small and non-linear: stored explicitly
+        for name, (base, size) in STORE_FAMILIES.items():
+            for t in range(size):
+                explicit[base + t] = C[base + t]
     for name, x in [("plain", plain), ("fam_base", np.stack(fam_base)), ("fam_delta", np.stack(fam_delta)),
                     ("special_rows", T[special]), ("explicit_rows", np.stack([explicit[t] for t in sorted(explicit)]))]:
-        assert np.array_equal(x.astype(np.float32), np.array(mx.array(x).astype(mx.bfloat16).astype(mx.float32))), name
+        assert np.array_equal(x.astype(np.float32), _bf16_roundtrip(x)), name
 
-    W: Dict[str, mx.array] = {}
-    bf = lambda x: mx.array(x).astype(mx.bfloat16)  # noqa: E731
-    i32 = lambda x: mx.array(np.asarray(x, dtype=np.int32))  # noqa: E731
+    W: dict = {}
+    bf, i32 = _as_bf16, _as_i32  # noqa: E731
     for L, layer in enumerate(layers):
         p = f"L{L}."
         for k in ("qkv", "z", "b", "a", "gate", "up"):
@@ -208,19 +365,33 @@ def convert(src, out) -> dict:
             W[p + "heads"] = i32(layer["heads"])  # (the checkpoint's value head of each: where its snapshot rows go)
             for k in ("A_log", "dt_bias", "norm"):
                 W[p + k] = bf(layer[k])
-    W["emb.plain"], W["emb.bitcols"], W["emb.bits"] = bf(plain), i32(bitcols), mx.array(bits)
+    W["emb.plain"], W["emb.bitcols"] = bf(plain), i32(bitcols)
+    if HAVE_MLX:
+        W["emb.bits"] = mx.array(bits)
+    else:
+        import torch
+
+        W["emb.bits"] = torch.from_numpy(bits)
     W["emb.special_ids"], W["emb.special_rows"] = i32(special), bf(T[special])
     W["emb.fam_base"], W["emb.fam_delta"] = bf(np.stack(fam_base)), bf(np.stack(fam_delta))
     W["emb.explicit_ids"] = i32(sorted(explicit))
     W["emb.explicit_rows"] = bf(np.stack([explicit[t] for t in sorted(explicit)]))
+    if has_store:
+        W["emb.id_xb"], W["emb.id_yc"] = i32(id_xb), i32(id_yc)
+        W["emb.det_ids"] = i32(det_ids)
+        W["emb.det_rows"] = bf(det_rows if len(det_ids) else np.zeros((1, len(dims)), np.float32))
     W["dims"] = i32(dims)
     out.mkdir(parents=True, exist_ok=True)
-    mx.save_safetensors(str(out / "chip.safetensors"), W)
-    info = {"format": 1, "source": str(src), "hidden": H, "layers": n_chip, "chip_token_offset": v0,
-            "chip_vocab": meta["chip_vocab"], "code": [pos[d] for d in meta["code_dims"]], "tau": pos[meta["tau_dim"]],
+    _save_pack(out / "chip.safetensors", W)
+    info = {"format": 2 if has_store else 1, "source": str(src), "hidden": H, "layers": n_chip,
+            "chip_token_offset": v0, "chip_vocab": meta["chip_vocab"], "layout": layout,
+            "d_qwen": d_qwen, "ballast_dims": meta.get("ballast_dims"),
+            "code": [pos[d] for d in meta["code_dims"]], "tau": pos[meta["tau_dim"]],
             "mu": pos[meta["mu_dim"]], "nfam": meta["nfam"], "npay": meta["npay"], "tool_call": meta["tool_call"],
             "printable": meta["printable"], "eos": [248046, 248044], "dims": len(dims),
-            "parameters": int(sum(v.size for k, v in W.items() if k.endswith(".w")))}
+            "out_names": STORE_OUT_NAMES if has_store else OUT_NAMES,
+            "store_families": [list(x) for x in STORE_FAMILY_SIZES] if has_store else [],
+            "parameters": int(sum(np.asarray(_to_numpy(v)).size for k, v in W.items() if k.endswith(".w")))}
     (out / "chip.json").write_text(json.dumps(info, indent=1))
     return info
 
@@ -282,6 +453,48 @@ def ensure_pack(log=print) -> Path:
             shutil.rmtree(tmp, ignore_errors=True)
     log(f"locals: Qwenputer's chip pack is in {d} ({info['parameters'] / 1e6:.0f}M weights); the checkpoint in the "
         "Hugging Face cache is no longer needed")
+    return d
+
+
+ETH_ELF = Path(__file__).with_name("eth-bridge.elf")  # the eth firmware, shipped in the repo
+
+
+def pack_dir_eth() -> Path:
+    return Path(os.environ.get("LOCALS_HOME", Path.home() / ".locals")) / "ethereus" / "untrained9b"
+
+
+def ensure_pack_eth(log=print) -> Path:
+    """Ethereus-9B's chip pack, made on first use from the local checkpoint (``ETH_SRC``) and the
+    repo's ``eth-bridge.elf`` firmware. Afterwards the checkpoint is not needed."""
+    d = pack_dir_eth()
+    if all((d / f).exists() for f in ("chip.safetensors", "chip.json", "snapshot.safetensors", ETH_FIRMWARE)):
+        return d
+    if chipformer() is None:
+        raise RuntimeError("Ethereus-9B's firmware is loaded by the chipformer package, which is not installed: "
+                           + INSTALL)
+    import shutil
+    import tempfile
+
+    src = os.environ.get("ETH_SRC")
+    if not src or not Path(src).exists():
+        raise RuntimeError("Ethereus-9B's checkpoint is local: set ETH_SRC to its folder "
+                           "(Ethereus-9B untrained, with chipformer.json)")
+    if not ETH_ELF.exists():
+        raise RuntimeError(f"Ethereus-9B's firmware {ETH_ELF} is missing from the repo")
+    src = Path(src)
+    tmp = Path(tempfile.mkdtemp(prefix="eth-pack-", dir=d.parent if d.parent.exists() else None))
+    try:
+        info = convert(src, tmp)
+        shutil.copy(ETH_ELF, tmp / ETH_FIRMWARE)
+        add_snapshot(tmp, firmware_states(src, tmp / ETH_FIRMWARE))
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if d.exists():
+            shutil.rmtree(d)
+        tmp.rename(d)
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+    log(f"locals: Ethereus-9B's chip pack is in {d} ({info['parameters'] / 1e6:.0f}M weights)")
     return d
 
 
@@ -360,8 +573,14 @@ def firmware_states(src, firmware) -> dict:
     from chipformer.rv import bridge, core, elf, ref
 
     cfg = json.loads((Path(src) / "config.json").read_text())
+    meta = json.loads((Path(src) / "chipformer.json").read_text()) if (Path(src) / "chipformer.json").exists() else {}
+    store = None
+    if meta.get("layout") == "rv1-store" and meta.get("store"):
+        from chipformer.rv import store as _ST
+
+        store = _ST.Config(**meta["store"])
     c = core.build(Target(cfg["linear_num_key_heads"], cfg["linear_num_value_heads"], cfg["intermediate_size"]),
-                   bridge.Text(Path(src) / "tokenizer.json"))
+                   bridge.Text(Path(src) / "tokenizer.json"), store)
     m = ref.Machine.from_program(firmware if hasattr(firmware, "text") else elf.program(str(firmware)))
     bridge.park(m)
     core.snapshot(c, m)
@@ -388,20 +607,21 @@ def is_qwenputer(model_id: str) -> bool:
 def add_snapshot(pack, states, file: str = "snapshot.safetensors") -> None:
     """Write the firmware into a chip pack: ``states`` maps "L{n}" to the checkpoint's recurrent state of computer
     layer n after loading the parked firmware, (value heads, key rows, value columns) as the authors' rv/hf.py
-    inject writes it (their core.snapshot of calc-bridge.elf). Kept per compacted head, in MLX's layout (value
-    rows, key columns)."""
+    inject writes it (their core.snapshot of the bridge firmware). Kept per compacted head, in MLX's layout
+    (value rows, key columns)."""
     pack = Path(pack)
-    W = mx.load(str(pack / "chip.safetensors"))
+    W = _load_shard(pack / "chip.safetensors")
     out = {}
     for name, st in states.items():
         st = np.asarray(st, np.float32)
-        heads = np.array(W[f"{name}.heads"]) if f"{name}.heads" in W else np.zeros(0, np.int64)
+        heads = _to_numpy(W[f"{name}.heads"]).astype(np.int64) if f"{name}.heads" in W else np.zeros(0, np.int64)
         other = np.setdiff1d(np.arange(st.shape[0]), heads)
         assert not st[other].any(), f"{name}: the snapshot fills a head the computer does not use"
         if len(heads):
-            out[name] = mx.array(np.ascontiguousarray(st[heads].transpose(0, 2, 1)))
+            arr = np.ascontiguousarray(st[heads].transpose(0, 2, 1))
+            out[name] = mx.array(arr) if HAVE_MLX else __import__("torch").from_numpy(arr)
     tmp = pack / f".{file}.{os.getpid()}.safetensors"  # (written whole, then named: a server starting next to another,
-    mx.save_safetensors(str(tmp), out)                # or a write cut short, never leaves a part of one)
+    _save_pack(tmp, out)  # or a write cut short, never leaves a part of one)
     os.replace(tmp, pack / file)
 
 
@@ -418,20 +638,19 @@ def _compact_out(w: np.ndarray):
 
 
 # -- the computer ---------------------------------------------------------------------------------------------------
-f32, bf16 = mx.float32, mx.bfloat16
-
-
-def _silu(x: mx.array) -> mx.array:  # torch's: x / (1 + exp(-x)), in fp32
+def _silu(x):
+    """torch's SiLU: x / (1 + exp(-x)), in fp32 (MLX on the Mac)."""
     return x / (1 + mx.exp(-x))
 
 
-def _softplus(x: mx.array) -> mx.array:  # torch's (threshold 20)
+def _softplus(x):
+    """torch's softplus (threshold 20, MLX on the Mac)."""
     return mx.where(x > 20, x, mx.log1p(mx.exp(mx.minimum(x, 20))))
 
 
-def _rms(x: mx.array, n: int) -> mx.array:
+def _rms(x, n: int):
     """Qwen3_5RMSNorm over the full hidden size n with gain 1 (the computer layers' norms): x is the residual's
-    computer dims; Qwen's dims are below fp32's resolution of the ballast's 62 * 2^80."""
+    computer dims; Qwen's dims are below fp32's resolution of the ballast (m * 2^80)."""
     xf = x.astype(f32)
     return (xf * mx.rsqrt((xf * xf).sum(-1, keepdims=True) / n + EPS)).astype(bf16)
 
@@ -448,6 +667,8 @@ class Chip:
     def __init__(self, path, tools: bool = False):
         """A chip pack's computer; ``tools``: its firmware the toolbox (``ensure_tools``), if the pack has it, else
         calc's alone (``self.tools``: the tools the firmware runs besides calc)."""
+        if not HAVE_MLX:
+            raise RuntimeError("Chip runs on MLX (the Mac); on CPU/Linux use ethereus_cpu.CpuChip instead")
         path = Path(path)
         self.info = json.loads((path / "chip.json").read_text())
         self.W = mx.load(str(path / "chip.safetensors"))
@@ -455,6 +676,8 @@ class Chip:
         self.code = mx.array(self.info["code"])
         self.nfam, self.npay = self.info["nfam"], self.info["npay"]
         self.printable = self.info["printable"]
+        self.out_names = self.info.get("out_names", OUT_NAMES)
+        self.has_store = bool(self.info.get("store_families"))
         snap = path / "snapshot.safetensors"
         self.tools: tuple = ()
         if tools and (path / tools_snapshot()).exists():
@@ -464,7 +687,9 @@ class Chip:
         self._emb = e
         self._special = {int(t): i for i, t in enumerate(e["special_ids"])}
         self._explicit = {int(t): i for i, t in enumerate(e["explicit_ids"])}
-        self._fam_of = np.zeros(CHIP_VOCAB, np.int32)
+        self._det = {int(t): i for i, t in enumerate(e["det_ids"])} if "det_ids" in e else {}
+        cvocab = self.info.get("chip_vocab", CHIP_VOCAB)
+        self._fam_of = np.zeros(cvocab, np.int32)
         for i, (base, size) in enumerate(FAMILIES.values()):
             self._fam_of[base:base + size] = i
         self._fam_base = np.array([b for b, _ in FAMILIES.values()])
@@ -478,8 +703,16 @@ class Chip:
             i = self._special.get(t)
             if i is not None:
                 return e["special_rows"][i]
+            j = self._det.get(t)
+            if j is not None:
+                return e["det_rows"][j]
             r = e["plain"].copy()
             r[e["bitcols"]] = np.unpackbits(e["bits"][t])[:len(e["bitcols"])]
+            if "id_xb" in e and t < 248044:  # the store's id bits (computed from the id)
+                for k, c in enumerate(e["id_xb"]):
+                    r[c] = (t >> k) & 1
+                for k, c in enumerate(e["id_yc"]):
+                    r[c] = 128.0 * (2 * ((t >> k) & 1) - 1)
             return r
         c = t - self.v0
         i = self._explicit.get(c)
@@ -614,18 +847,24 @@ class Chip:
 
     def decode(self, fid: int, p: int) -> int:
         """A model token id from an output code (rv/core.py decode_code); -2 if the code names no token."""
-        if not 0 <= fid < len(OUT_NAMES):
+        if not 0 <= fid < len(self.out_names):
             return -2
-        name = OUT_NAMES[fid]
+        name = self.out_names[fid]
         if name == "Q":
             return self.printable[p] if p < len(self.printable) else -2
         if name in CONTROL_NAMES:
             return self.v0 + CTRL + CONTROL_NAMES.index(name)
-        base, size = FAMILIES[name]
+        fams = {**FAMILIES, **STORE_FAMILIES} if self.has_store else FAMILIES
+        base, size = fams[name]
         return self.v0 + base + p if p < size else -2
 
     def name(self, t: int) -> str:
         c = t - self.v0
+        if self.has_store and c >= CHIP_VOCAB:
+            for n, (b, s) in STORE_FAMILIES.items():
+                if b <= c < b + s:
+                    return f"{n}({c - b})"
+            return f"?({c})"
         if c >= CTRL:
             return CONTROL_NAMES[c - CTRL]
         f = int(self._fam_of[c])
@@ -641,6 +880,16 @@ CALC_TOOL = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {
         "expression": {"type": "string", "description": "e.g. 123456789*987654321-42 or 1.25*-3.5 or 84/18"}},
         "required": ["expression"]}}}  # (the authors' rv/chat.py)
+
+ETH_TOOL = {"type": "function", "function": {
+    "name": "eth",
+    "description": "Ethereum exact tools, run by the model's own computer: keccak256, 256-bit arithmetic, "
+                   "function selectors, ABI encoding and decoding, CREATE/CREATE2 addresses, and EVM execution. "
+                   "Returns the exact value.",
+    "parameters": {"type": "object", "properties": {
+        "cmd": {"type": "string", "description": "e.g. keccak 0x6161, encode transfer(address,uint256) 0x... 100, "
+                "decode uint256 0x..., selector transfer(address,uint256), u256 2**255 - 1"}},
+        "required": ["cmd"]}}}
 
 
 def _tool(name: str, description: str, optional=(), **params) -> dict:
