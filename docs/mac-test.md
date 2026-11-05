@@ -4,7 +4,9 @@ The Mac-only parts — the MLX computer (`models/qwenputer.py` `Chip`,
 `models/qwenputer_walk.py` walkers) and the C stepper
 (`models/qwenputer_cpu.py`, built with clang) — cannot run on Linux. This
 page gives the exact commands to test them on an Apple-silicon Mac. All
-commands run from the repo root (`~/ethereus-mac`).
+commands run from the repo root (`~/ethereus-mac`). There are two packs:
+`eth` (`~/.locals/ethereus/untrained9b`) and Solana (`~/.locals/ethereus/sol9b`),
+same chip, different firmware snapshots.
 
 ## 0. Prereqs
 
@@ -13,9 +15,10 @@ xcode-select --install            # clang for the C stepper (once)
 curl -LsSf astral.sh/uv/install.sh | sh   # uv (once); then restart the shell
 ```
 
-Apple silicon with 32 GB RAM or more. The Ethereus-9B pack is ~208 MB;
-Qwen's part (`mlx-community/Qwen3.5-9B-MLX-4bit`, 4-bit) downloads on
-first use (~6 GB in the Hugging Face cache).
+Apple silicon with 32 GB RAM or more. Each pack is ~208 MB (the chip weights
+are identical; only the snapshot and firmware differ); Qwen's part
+(`mlx-community/Qwen3.5-9B-MLX-4bit`, 4-bit) downloads on first use (~6 GB
+in the Hugging Face cache).
 
 ## 1. Install
 
@@ -23,18 +26,19 @@ first use (~6 GB in the Hugging Face cache).
 uv sync
 ```
 
-## 2. The chip pack
+## 2. The chip packs
 
-Copy the pack built on Linux (preferred; building needs the 37 GB
+Copy the packs built on Linux (preferred; building needs the 37 GB
 checkpoint). From the Mac, with the Linux host reachable as `linux`:
 
 ```sh
-mkdir -p ~/.locals/ethereus/untrained9b
+mkdir -p ~/.locals/ethereus/untrained9b ~/.locals/ethereus/sol9b
 scp 'linux:/tmp/eth-pack/{chip.safetensors,chip.json,snapshot.safetensors,eth-bridge.elf}' ~/.locals/ethereus/untrained9b/
-ls -lh ~/.locals/ethereus/untrained9b/
+scp 'linux:/tmp/sol-pack/{chip.safetensors,chip.json,snapshot.safetensors,sol-bridge.elf}' ~/.locals/ethereus/sol9b/
+ls -lh ~/.locals/ethereus/untrained9b/ ~/.locals/ethereus/sol9b/
 ```
 
-Or build it from the checkpoint (needs `ETH_SRC` with
+Or build them from the checkpoint (needs `ETH_SRC` with
 `chipformer.json`, `config.json`, `tokenizer.json`,
 `model.safetensors.index.json` and the 15 shards, plus
 `LOCALS_CHIPFORMER` with the chipformer package):
@@ -42,7 +46,12 @@ Or build it from the checkpoint (needs `ETH_SRC` with
 ```sh
 ETH_SRC=/path/to/q9-store-rv LOCALS_CHIPFORMER=/path/to/chipformer \
   uv run python -c "from locals.models.qwenputer import ensure_pack_eth; print(ensure_pack_eth())"
+ETH_SRC=/path/to/q9-store-rv LOCALS_CHIPFORMER=/path/to/chipformer \
+  uv run python -c "from locals.models.qwenputer import ensure_pack_sol; print(ensure_pack_sol())"
 ```
+
+(`ensure_pack_sol` reuses the eth pack's chip when present — same checkpoint —
+and only snapshots the sol firmware.)
 
 ## 3. Tokenizer for the reference machine
 
@@ -64,22 +73,25 @@ The reference machine also needs the chipformer package:
 export LOCALS_CHIPFORMER=/path/to/chipformer   # experimental/riscv, with chipformer/rv/{ref,bridge,elf,spec}.py
 ```
 
-## 4. Exactness: pack vs reference, 50 eth tool calls
+## 4. Exactness: packs vs reference
 
 ```sh
-uv run pytest tests/test_ethereus.py -q
+uv run pytest tests/test_ethereus.py tests/test_sol.py -q
 ```
 
-This runs the pack's computer on the GPU (MLX `Chip` + `FusedStep`)
-against `bridge.Session` on `eth-bridge.elf`, token for token, on 50
-`eth` calls (keccak, ABI encode/decode, EIP-712 type hashes, address
-checks). Expect `50 passed` (plus the categories check). On an M2 Pro
-about 10–20 minutes; the long keccak runs dominate.
+This runs each pack's computer on the GPU (MLX `Chip` + `FusedStep`)
+against `bridge.Session` on its firmware, token for token: 50 `eth`
+calls (keccak, ABI encode/decode, EIP-712 type hashes, address checks)
+and 68 `sol` calls (SHA-256, base58, amounts, u64/u128, discriminators,
+borsh, instruction building, fees, rent, key/pda/seed/ATA). Expect
+`118 passed` (plus the categories checks). On an M2 Pro about
+15–30 minutes; the long keccak and ed25519 runs dominate.
 
-A single short call, to smoke-test the setup first:
+Single short calls, to smoke-test each setup first:
 
 ```sh
 uv run pytest tests/test_ethereus.py -q -k "0xZZ"
+SOL_PACK=~/.locals/ethereus/sol9b uv run pytest tests/test_sol.py -q -k "u64 and 1+2"
 ```
 
 ## 5. C stepper
@@ -125,18 +137,23 @@ uv run pytest tests/test_qwenputer_c.py tests/test_qwenputer.py -q
 Serve Ethereus-9B (Qwen's part downloads on first use):
 
 ```sh
-uv run locals-server --model ethereus-9b
+uv run locals-server --model ethereus-9b        # the eth computer
+uv run locals-server --model ethereus-9b-sol    # the sol computer (same chip, sol firmware)
 ```
 
-Then ask for an `eth` tool call, e.g. "What is keccak of 0x6161?
-Use the eth tool." The reply's `<tool_response>` carries the exact
-value.
+Then ask for a tool call, e.g. "What is keccak of 0x6161? Use the
+eth tool." or "What is sha256 of abc? Use the sol tool." The reply's
+`<tool_response>` carries the exact value.
 
 ## What was verified on Linux
 
-The pack was built from `/workspace/dist-store/q9-store-rv` on CPU
-and reproduces `ref.py` token for token on all 50 calls (torch runner,
-`locals/models/ethereus_cpu.py`; see `ETHEREUS_CHANGES.md`). The MLX
+Both packs were built from `/workspace/dist-store/q9-store-rv` on CPU
+(the sol pack reuses the eth pack's chip bytes: same checkpoint, same
+`convert`; only the snapshot differs) and reproduce `ref.py` token for
+token — 50 `eth` calls and 68 `sol` calls (torch runner,
+`locals/models/ethereus_cpu.py`; see `ETHEREUS_CHANGES.md`). On Linux
+the 68 are 62 full runs plus 8k-token prefixes of the 6 ed25519-longest
+(ATA, PDA, key, seed, names); the Mac test runs all 68 fully. The MLX
 walkers and the C build only parse on Linux; their store support
 (`rv1-store` text rows, 23 ballast dims) is new and untested until
 step 4 above passes on a Mac.

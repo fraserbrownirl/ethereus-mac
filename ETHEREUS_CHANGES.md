@@ -51,3 +51,25 @@ Built on CPU with `qwenputer.convert` + `firmware_states`/`add_snapshot`:
 `chip.safetensors` (189 MB, 83M dense compacted params, R=1781),
 `snapshot.safetensors` (19 MB), `chip.json`, `eth-bridge.elf` — ~208 MB total
 (Qwenputer-4B's pack is 123 MB).
+
+## Solana pack (same checkpoint, sol firmware)
+
+No separate Solana checkpoint exists by design: the circuit's weights are
+firmware-independent, so the Solana pack reuses the eth pack's chip bytes
+(`chip.safetensors` sha256 `7d756fd4…`, identical) with `/workspace/sol/
+sol-bridge.elf` (sha256 `a46fd5a3…`, 189 KB, shipped in the repo) as the
+parked snapshot and the sol tool (`tool_schema.json`, shipped; `SOL_TOOL`
+in code). Model id `ethereus-9b-sol` (same Qwen part); `ensure_pack_sol`
+copies the eth pack's chip when present. `tests/test_sol.py`: 68 sol calls
+vs `ref.py` token for token (SHA-256, base58, amounts, u64/u128,
+discriminators incl. TransferChecked, borsh encode/decode of instruction
+data fields, `ix` system/token/memo/compute builders, fee, rent, key/pda/
+seed/ATA). Arg orders follow the sol oracle (`chipformer/rv/sol.py`):
+transfer_checked takes source dest mint owner amount decimals, memo takes
+message signer. Full-length ATA/PDA/ed25519 runs exceed convenient CPU
+time, so Linux verification runs shorts fully and 8k prefixes of the 6
+longest (the Mac test runs all 68 fully). The oracle is the
+`/workspace/ethereus-solana` repo's `ref.py` (byte-identical `ref`,
+`bridge`, `elf`, `spec` to the main tree; all 68 wants verified equal
+under both); its `eval_exact.json` vectors (e.g. transfer_checked data
+`0x0c68866102c407000009`) match the firmware's answers.

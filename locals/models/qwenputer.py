@@ -58,6 +58,10 @@ BASE = "mlx-community/Qwen3.5-4B-MLX-4bit"  # Qwen's part: its 32 layers, quanti
 ETH_BASE = "mlx-community/Qwen3.5-9B-MLX-4bit"  # Qwen's part on the Mac
 ETH_D_QWEN = 4096  # Qwen3.5-9B's hidden size: the computer's dims come after it
 ETH_FIRMWARE = "eth-bridge.elf"  # the eth tool-call firmware, built with -DBRIDGE (see ETHEREUS_CHANGES.md)
+# Solana: the same checkpoint (the circuit's weights are firmware-independent) with the sol firmware
+# (/workspace/sol/sol-bridge.elf, sha256 a46fd5a3...) as the parked snapshot and the sol tool.
+SOL_FIRMWARE = "sol-bridge.elf"
+SOL_SCHEMA = Path(__file__).with_name("sol_tool_schema.json")  # the sol tool, shipped from /workspace/sol/
 # The authors' reference package (their RV32 machine, circuit compiler, text bridge): it loads the firmware into a
 # chip pack, and drafts the computer's runs while Locals serves (``chipformer()``).
 CHIPFORMER = "ca13310e2f9f788d1dd3feeea8213c1b0c23913c"
@@ -498,6 +502,60 @@ def ensure_pack_eth(log=print) -> Path:
     return d
 
 
+SOL_ELF = Path(__file__).with_name("sol-bridge.elf")  # the sol firmware, shipped in the repo
+
+
+def pack_dir_sol() -> Path:
+    return Path(os.environ.get("LOCALS_HOME", Path.home() / ".locals")) / "ethereus" / "sol9b"
+
+
+def ensure_pack_sol(log=print) -> Path:
+    """Ethereus-9B Solana pack: the same checkpoint's chip (copied from the eth pack when present,
+    else converted from ``ETH_SRC``) with the repo's ``sol-bridge.elf`` firmware as the snapshot."""
+    d = pack_dir_sol()
+    if all((d / f).exists() for f in ("chip.safetensors", "chip.json", "snapshot.safetensors", SOL_FIRMWARE)):
+        return d
+    if chipformer() is None:
+        raise RuntimeError("the sol firmware is loaded by the chipformer package, which is not installed: " + INSTALL)
+    import shutil
+    import tempfile
+
+    if not SOL_ELF.exists():
+        raise RuntimeError(f"the sol firmware {SOL_ELF} is missing from the repo")
+    eth = pack_dir_eth()
+    tmp = Path(tempfile.mkdtemp(prefix="sol-pack-", dir=d.parent if d.parent.exists() else None))
+    try:
+        if all((eth / f).exists() for f in ("chip.safetensors", "chip.json")):
+            log("locals: Solana pack reuses the eth pack's chip (same checkpoint)")
+            shutil.copy(eth / "chip.safetensors", tmp / "chip.safetensors")
+            info = json.loads((eth / "chip.json").read_text())
+            info["firmware"], info["tool"] = SOL_FIRMWARE, "sol"
+            (tmp / "chip.json").write_text(json.dumps(info, indent=1))
+            src = Path(info.get("source") or os.environ.get("ETH_SRC") or "")
+        else:
+            src = os.environ.get("ETH_SRC")
+            if not src or not Path(src).exists():
+                raise RuntimeError("no eth pack and no checkpoint: set ETH_SRC to its folder "
+                                   "(Ethereus-9B untrained, with chipformer.json)")
+            src = Path(src)
+            info = convert(src, tmp)
+            info["firmware"], info["tool"] = SOL_FIRMWARE, "sol"
+            (tmp / "chip.json").write_text(json.dumps(info, indent=1))
+        shutil.copy(SOL_ELF, tmp / SOL_FIRMWARE)
+        if not str(src) or not (src / "tokenizer.json").exists():
+            raise RuntimeError("the sol snapshot needs the checkpoint tokenizer: set ETH_SRC to its folder")
+        add_snapshot(tmp, firmware_states(src, tmp / SOL_FIRMWARE))
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if d.exists():
+            shutil.rmtree(d)
+        tmp.rename(d)
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+    log(f"locals: Solana pack is in {d} ({info['parameters'] / 1e6:.0f}M weights)")
+    return d
+
+
 def toolbox(firmware):
     """The toolbox firmware (an asm.Program of the authors' package): calc's firmware (an ELF), the toolbox's code
     after its code and its read-only data after calc's, and calc's resume after its park turned into a jump to the
@@ -890,6 +948,14 @@ ETH_TOOL = {"type": "function", "function": {
         "cmd": {"type": "string", "description": "e.g. keccak 0x6161, encode transfer(address,uint256) 0x... 100, "
                 "decode uint256 0x..., selector transfer(address,uint256), u256 2**255 - 1"}},
         "required": ["cmd"]}}}
+
+
+def _sol_tool() -> dict | None:
+    """The sol tool schema, shipped from /workspace/sol/tool_schema.json (the firmware's own tool)."""
+    return json.loads(SOL_SCHEMA.read_text()) if SOL_SCHEMA.exists() else None
+
+
+SOL_TOOL = _sol_tool()
 
 
 def _tool(name: str, description: str, optional=(), **params) -> dict:

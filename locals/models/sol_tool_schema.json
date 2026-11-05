@@ -1,0 +1,19 @@
+{
+  "type": "function",
+  "function": {
+    "name": "sol",
+    "description": "Exact Solana helpers, run inside the model. One command per call: sha256 <text|0xhex|'quoted'>, b58 enc|dec <text>, u64|u128 <expr>, lamports|sol|amount|ui <value...>, key <base58|name>, pda <program> <seed>... [bump <n>], seed <base> <seed-string> <owner>, ata <wallet> <mint> [token22], names, disc ix <snake>|account <Camel>|event <Camel>, borsh enc <schema> <values...> / borsh dec <schema> <hex>, ix <builder> <args...> (system.* token.* token22.* ata.* compute.* memo), fee <signatures> [cu_limit cu_price], rent <data_bytes>, help. An argument too long for the call can be named as @file. Returns the exact result or error (...).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "cmd": {
+          "type": "string",
+          "description": "e.g. pda system str:vault or disc ix transfer or borsh enc u8 255 or fee 2 200000 5000"
+        }
+      },
+      "required": [
+        "cmd"
+      ]
+    }
+  }
+}
