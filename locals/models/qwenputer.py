@@ -903,6 +903,10 @@ class Chip:
             out[i] = self.decode(int(fid[i]), int(pay[i]))
         return out
 
+    def read(self, toks: List[int], st: ChipState) -> np.ndarray:
+        """Teacher-forced predictions for known tokens (one block), as ``ethereus_cpu.CpuChip.read``."""
+        return self.predict(self(self.embed([toks]), st))[0]
+
     def decode(self, fid: int, p: int) -> int:
         """A model token id from an output code (rv/core.py decode_code); -2 if the code names no token."""
         if not 0 <= fid < len(self.out_names):
@@ -1342,6 +1346,9 @@ if (set) {
         tok = V0 + CTRL + (fid - NFAMS); e = expl[CTRL + (fid - NFAMS)];
     } else if (fid == NFAMS + NCTRL && pay < NPRINT) {
         tok = printable[pay]; e = -2 - pay;
+    } else if (fid > NFAMS + NCTRL && fid <= NFAMS + NCTRL + NSTORE) {  // the store's families (explicit rows)
+        int k = fid - NFAMS - NCTRL - 1;
+        if (pay < sfsize[k]) { tok = V0 + sfbase[k] + pay; e = expl[sfbase[k] + pay]; if (e < 0) tok = -2; } else tok = -2;
     } else tok = -2;
 }
 if (tok == -1 && cur[b] >= V0) tok = -3;
@@ -1410,18 +1417,21 @@ class FusedStep:
         self.k_out = mk(name="qwenputer_out", input_names=["x", "y", "wrow", "ptr", "col", "val"],
                         output_names=["xo"], source=_OUT)
         self.k_next = mk(name="qwenputer_next", input_names=["h", "cur", "act", "code", "fsize", "fbase", "expl", "printable",
-                                                             "prow", "erows", "srows", "fb", "fd"],
+                                                             "prow", "erows", "srows", "fb", "fd", "sfsize", "sfbase"],
                          output_names=["nt", "nact", "xn"], source=_NEXT)
         e = chip._emb
-        expl = np.full(CHIP_VOCAB, -1, np.int32)
+        expl = np.full(chip.info.get("chip_vocab", CHIP_VOCAB), -1, np.int32)  # a store pack's tokens run past CHIP_VOCAB
+        store = list(STORE_FAMILIES.values()) if chip.has_store else [(0, 0)]
         expl[e["explicit_ids"]] = np.arange(len(e["explicit_ids"]))
         srow = {int(t): i for i, t in enumerate(e["special_ids"])}
         self.tables = [chip.code.astype(mx.int32), mx.array([sz for _, sz in FAMILY_SIZES], mx.int32),
                        mx.array([b for b, _ in FAMILIES.values()], mx.int32), mx.array(expl),
                        mx.array(np.array(chip.printable, np.int32)), mx.array(np.array([srow[t] for t in chip.printable], np.int32)),
-                       W["emb.explicit_rows"], W["emb.special_rows"], W["emb.fam_base"], W["emb.fam_delta"]]
+                       W["emb.explicit_rows"], W["emb.special_rows"], W["emb.fam_base"], W["emb.fam_delta"],
+                       mx.array([sz for _, sz in store], mx.int32), mx.array([b for b, _ in store], mx.int32)]
         self.consts = [("R", self.R), ("NFAM", chip.nfam), ("NPAY", chip.npay), ("NFAMS", len(FAMILY_SIZES)),
-                       ("NCTRL", len(CONTROL_NAMES)), ("NPRINT", len(chip.printable)), ("V0", chip.v0), ("CTRL", CTRL)]
+                       ("NCTRL", len(CONTROL_NAMES)), ("NPRINT", len(chip.printable)), ("V0", chip.v0), ("CTRL", CTRL),
+                       ("NSTORE", len(STORE_FAMILIES) if chip.has_store else 0)]
         self.chip = chip
 
     def _out(self, w, to):
