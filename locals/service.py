@@ -443,7 +443,7 @@ class BatchService:
             eth = is_ethereus(self.model_id)
             pack = QP.ensure_pack_eth(log=say) if eth else QP.ensure_pack(log=say)
             if eth:
-                say(f"locals: Ethereus pack {pack} ({QP.json.loads((pack / 'chip.json').read_text()).get('image', '')})")
+                say(f"locals: chip pack {pack} ({QP.json.loads((pack / 'chip.json').read_text()).get('image', '')})")
             # its toolbox, with qwenputer-cpu (LOCALS_QWENPUTER_TOOLS=1 or 0 says otherwise): more tools the computer
             # runs in place of the client, and its checks; without it, calc alone on the authors' firmware
             default = "1" if qwenputer_cpu(self.model_id) and not eth else "0"
