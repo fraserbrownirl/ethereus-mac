@@ -26,7 +26,7 @@ MODELS = {
     # (models/qwenputer.py, ETH_TOOL): Qwen's part is qwen3.5-9b's weights; the computer comes from the local
     # Ethereus-9B checkpoint, converted into a ~208 MB pack (its firmware is in the repo: eth-bridge.elf).
     # Not a repository: the pack is built from ETH_SRC (hf_repo falls through to the model itself).
-    "ethereus-9b": "mlx-community/Qwen3.5-9B-MLX-4bit",
+    "ethereus-9b": "ethereus-9b",  # (its own id: is_ethereus must see it; hf_repo gives Qwen's part)
 }
 
 
@@ -224,7 +224,7 @@ def hf_repo(model) -> str:
     """The Hugging Face repository a model's files come from: Qwenputer's for both its versions (qwenputer-cpu's id
     names none), Ethereus-9B's Qwen part for it (its computer comes from a local pack), else the model itself."""
     if is_ethereus(model):
-        return MODELS["ethereus-9b"]
+        return "mlx-community/Qwen3.5-9B-MLX-4bit"
     return MODELS["qwenputer-4b"] if is_qwenputer(model) else model
 
 
@@ -234,7 +234,7 @@ def weights_gb(model: str, remote: bool = False) -> "float | None":
     (``streamed``) counts what stays in GPU memory; Qwenputer, Qwen3.5-4B's and its computer's (its 18.8 GB
     checkpoint is only read once, into a pack)."""
     if is_qwenputer(model):
-        base = weights_gb(MODELS["qwen3.5-4b"], remote)
+        base = weights_gb(hf_repo(model) if is_ethereus(model) else MODELS["qwen3.5-4b"], remote)
         return None if base is None else base + 0.15
     path = Path(model).expanduser()
     if not path.exists():

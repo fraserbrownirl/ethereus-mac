@@ -871,7 +871,7 @@ class CPU:
         ri, v = self._keep(rows[order], np.int32), self._keep(vals[order], np.float32)
         return _Mat(cp.ctypes.data, ri.ctypes.data, v.ctypes.data, ncols, n)
 
-    def run(self, s: np.ndarray, c: np.ndarray, mk: np.ndarray, first: int, max_tokens: int = 250_000,
+    def run(self, s: np.ndarray, c: np.ndarray, mk: np.ndarray, first: int, max_tokens: int = int(os.environ.get("LOCALS_MAX_RUN") or 250_000),
             threads: int = 1) -> Tuple[List[int], np.ndarray]:
         """A run from ``first`` (the token the computer predicted), as ``Computer.step`` makes it: the run's tokens
         after ``first`` (a negative last one: it failed); the packed state ``s``, convolutions ``c`` and masks ``mk``

@@ -460,7 +460,11 @@ ETH_ELF = Path(__file__).with_name("eth-bridge.elf")  # the eth firmware, shippe
 
 
 def pack_dir_eth() -> Path:
-    return Path(os.environ.get("LOCALS_HOME", Path.home() / ".locals")) / "ethereus" / "untrained9b"
+    """The Ethereus pack: LOCALS_ETH_PACK (a folder, or a name under ~/.locals/ethereus, e.g. all9b), else untrained9b."""
+    home = Path(os.environ.get("LOCALS_HOME", Path.home() / ".locals")) / "ethereus"
+    want = os.environ.get("LOCALS_ETH_PACK") or "untrained9b"
+    p = Path(want).expanduser()
+    return p if p.is_absolute() else home / want
 
 
 def ensure_pack_eth(log=print) -> Path:
@@ -596,6 +600,9 @@ def firmware_states(src, firmware) -> dict:
                     st[j * r + x, row] = np.asarray(vec, np.float64)
         out[f"L{L}"] = st
     return out
+
+
+CHIP_TOOLS = ("calc", "eth")  # tools whose call the computer's own firmware reads (not the toolbox's, in parts)
 
 
 def is_qwenputer(model_id: str) -> bool:
@@ -887,12 +894,14 @@ CALC_TOOL = {"type": "function", "function": {
 
 ETH_TOOL = {"type": "function", "function": {
     "name": "eth",
-    "description": "Ethereum exact tools, run by the model's own computer: keccak256, 256-bit arithmetic, "
-                   "function selectors, ABI encoding and decoding, CREATE/CREATE2 addresses, and EVM execution. "
+    "description": "Exact chain tools, run by the model's own computer: Ethereum keccak256, 256-bit arithmetic, "
+                   "function selectors, ABI encoding and decoding, CREATE/CREATE2 addresses and EVM execution; "
+                   "Solana (prefix sol): ATAs, PDAs, token amounts, instruction data, fees, rent, x402 checks. "
                    "Returns the exact value.",
     "parameters": {"type": "object", "properties": {
         "cmd": {"type": "string", "description": "e.g. keccak 0x6161, encode transfer(address,uint256) 0x... 100, "
-                "decode uint256 0x..., selector transfer(address,uint256), u256 2**255 - 1"}},
+                "decode uint256 0x..., selector transfer(address,uint256), u256 2**255 - 1, sol ata <wallet> usdc, "
+                "sol amount 12.5 6"}},
         "required": ["cmd"]}}}
 
 

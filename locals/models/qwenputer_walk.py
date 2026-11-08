@@ -39,7 +39,7 @@ from .qwenputer import CHIP_VOCAB, CONTROL_NAMES, CTRL, FAMILIES, FAMILY_SIZES, 
 
 # A run's tokens at most (then it failed): the toolbox's longest, a 900-token call's text written backwards, takes
 # about 200,000 (a minute on a core); its text counted, 80,000 to 110,000
-MAX_RUN = 250_000
+MAX_RUN = int(os.environ.get("LOCALS_MAX_RUN") or 250_000)  # (Ethereus sol/x402 runs need more: 2,000,000)
 
 _HEADER = """
 inline float r16(float x) { return static_cast<float>(static_cast<bfloat16_t>(x)); }
@@ -2106,7 +2106,7 @@ class CalcController(_controller_base()):
     def read_call(self) -> int:
         """The computer (made and given the prompt the first time) reads Qwen's tokens since its last run; the token
         it predicts after the call (the run's first; < 0: none)."""
-        if self.cut_runs >= CUTS and self.checking is None and self.tool not in (None, "calc") and not self.parts:
+        if self.cut_runs >= CUTS and self.checking is None and self.tool not in (None, "calc", "eth") and not self.parts:
             # (no run: the computer made again at the next call, from the reply so far, this call in it)
             self.comp, self.unread, self.notes_given, self.note, self.refused = None, [], False, None, True
             return -1
@@ -2117,7 +2117,7 @@ class CalcController(_controller_base()):
         unread = self.unread
         if self.parts:  # the next part of a long toolbox call
             unread = [self.tco] + self.parts.pop(0) + [self.tcc]
-        elif self.tool not in (None, "calc") and unread and unread[-1] == self.tcc and self.tco in unread:
+        elif self.tool not in (None, "calc", "eth") and unread and unread[-1] == self.tcc and self.tco in unread:
             # a toolbox call as the computer reads it: a row a whole token, and a call its rows cannot hold (it read
             # the first 79 tokens and then only the last) in parts, each a run (``_parts``)
             i = len(unread) - 1 - unread[::-1].index(self.tco)
@@ -2201,7 +2201,7 @@ class CalcController(_controller_base()):
         with self.lock:
             self._show(self.pres.feed("run", run), False)
         at = value.rfind("error (")  # (after what the program printed)
-        if at >= 0 and self.tool != "calc" and any(w in value[at:at + 80] for w in _SPENT):
+        if at >= 0 and self.tool not in ("calc", "eth") and any(w in value[at:at + 80] for w in _SPENT):
             self.cut_runs += 1
         if value and not value.startswith("error ("):
             self.results.append(value)

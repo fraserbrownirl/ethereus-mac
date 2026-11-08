@@ -382,6 +382,9 @@ class Server:
         if prefill:
             thinking = False
         msgs = oai.convert_messages(req.get("messages") or [], raw=self._raw if fmt.replay_raw else None)
+        sysfile = os.environ.get("LOCALS_SYSTEM_FILE")  # a default system prompt, for requests that bring none
+        if sysfile and not any(m.get("role") == "system" for m in msgs):
+            msgs.insert(0, {"role": "system", "content": Path(sysfile).expanduser().read_text().strip()})
         turns = notes = None
         if self.qwenputer:
             # the conversation before each message (Server._notes's keys, with a reply), and its notes so far
@@ -403,13 +406,15 @@ class Server:
         msgs, tpl_tools = fmt.prepare(msgs, tools)
         internal = computer = None
         if self.qwenputer:
-            from .models.qwenputer import CALC_TOOL, TOOL_SPECS, tools_for
+            from .defaults import is_ethereus
+            from .models.qwenputer import CALC_TOOL, ETH_TOOL, TOOL_SPECS, tools_for
 
             # the tools the model's computer runs itself (calc, and those of its toolbox the question asks for): never a
             # call for the client; one the client defines under the same name is the client's
             have = {t["function"]["name"] for t in tools}
             asked = tools_for(_last_user_text(msgs), getattr(svc, "qwenputer_tools", ()))
-            ours = [CALC_TOOL] + [t for t in TOOL_SPECS if t["function"]["name"] in asked]
+            ours = ([ETH_TOOL] if is_ethereus(self.model_id) else
+                    [CALC_TOOL] + [t for t in TOOL_SPECS if t["function"]["name"] in asked])
             ours = [t for t in ours if t["function"]["name"] not in have]
             tpl_tools = list(tpl_tools or []) + ours
             internal = tuple(t["function"]["name"] for t in ours)

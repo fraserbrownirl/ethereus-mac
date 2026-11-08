@@ -432,7 +432,7 @@ class BatchService:
         from .packed import Request
         from .runtime import Runtime
 
-        from .defaults import is_qwenputer, qwenputer_cpu
+        from .defaults import is_ethereus, is_qwenputer, qwenputer_cpu
 
         calc = None  # Qwenputer: its computer's device (shared by every conversation's computer)
         if is_qwenputer(self.model_id):
@@ -440,14 +440,17 @@ class BatchService:
             from .models.qwenputer_walk import Device
 
             say = lambda m: print(m, file=sys.stderr, flush=True)  # noqa: E731
-            pack = QP.ensure_pack(log=say)
+            eth = is_ethereus(self.model_id)
+            pack = QP.ensure_pack_eth(log=say) if eth else QP.ensure_pack(log=say)
+            if eth:
+                say(f"locals: Ethereus pack {pack} ({QP.json.loads((pack / 'chip.json').read_text()).get('image', '')})")
             # its toolbox, with qwenputer-cpu (LOCALS_QWENPUTER_TOOLS=1 or 0 says otherwise): more tools the computer
             # runs in place of the client, and its checks; without it, calc alone on the authors' firmware
-            default = "1" if qwenputer_cpu(self.model_id) else "0"
+            default = "1" if qwenputer_cpu(self.model_id) and not eth else "0"
             tools = os.environ.get("LOCALS_QWENPUTER_TOOLS", default) != "0" and QP.ensure_tools(pack, log=say)
             calc = Device(QP.Chip(pack, tools=tools))
             self.qwenputer_tools = calc.chip.tools
-        rt = Runtime.load(QP.BASE if calc else self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
+        rt = Runtime.load((QP.ETH_BASE if is_ethereus(self.model_id) else QP.BASE) if calc else self.model_id, tune=os.environ.get("LOCALS_TUNE", "background"))
         self._rt = rt
         store = getattr(rt.model, "expert_store", None)
         if store is not None:  # (experts read from the files as tokens need them: their GPU slots are made now, so
